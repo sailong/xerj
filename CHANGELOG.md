@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- With `[cluster] enabled = true`, `POST /v1/indices/{name}/docs` (one
+  document, or a JSON array with one document per element),
+  `DELETE /v1/indices/{name}/docs/{id}`, and
+  `POST /v1/indices/{name}/docs/_bulk` run on the shard primary, whichever
+  member accepted the request. The primary copies the stored document or
+  the delete onto the in-sync replicas and acknowledges it with the same
+  quorum as `PUT /{index}/_doc/{id}`. The caller still gets the native
+  envelope: `data.seq_no` is the engine's 1-based sequence (the ES
+  `_seq_no` plus one), a successful index or update is HTTP 201, and a
+  delete of a document that is already absent is HTTP 200 `deleted`. A
+  primary that does not answer is the native error body with HTTP 503,
+  and the accepting node does not store the document. A copy that misses
+  quorum is HTTP 503 `replica_not_acknowledged`: the primary has the
+  write. The index must already exist; this path does not create one.
+  A JSON array on this endpoint is a batch. It used to be stored as one
+  value, because the single-document shape was parsed first and accepts
+  any JSON. `POST /v1/indices/{name}/ingest` is unchanged and still
+  writes on the receiving node, as do logs, OTLP, syslog, and turbo.
+  A write still needs the primary. `[cluster] enabled = false` does not
+  take this path (part of
+  [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
+  open).
+
 - `xerj autoindex` names a file family in the run summary when every file of
   that family was junked, or when junked files are a strict majority
   (`junk_files * 2 > files`; stale-plan skips are not counted). The human
@@ -35,13 +58,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses the request before any document is written. A copy that misses
   quorum is HTTP 503 `replica_not_acknowledged`: the primaries that ran
   have the delete, and the response still reports `deleted` and
-  `failures`. `wait_for_completion=false` uses the same path. Native
-  `/v1` ingest still writes on the receiving node. A write still needs
-  the primary. `[cluster] enabled = false` does not take this path (part of
+  `failures`. `wait_for_completion=false` uses the same path. Native `/v1` logs,
+  OTLP, syslog, turbo, and pipeline ingest still write on the receiving
+  node. A write still needs the primary. `[cluster] enabled = false` does
+  not take this path (part of
   [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
   open).
 
 ### Fixed
+
+- `xerj mcp` no longer holds every message behind a slow tool call. Each
+  `tools/call` runs on its own task, so `ping`, `tools/list` and other
+  calls are answered while one call waits on the node. A ping sent 0.2 s
+  after a call to a stalled node was answered after 60 s; it is now
+  answered at once. `notifications/cancelled` now aborts the call it names,
+  and no response is sent for that call, as the MCP spec asks; it used to
+  be ignored. Replies can go out in any order (they are matched by `id`); a
+  batch is still answered one line per request
+  ([#2390](https://github.com/xerj-org/xerj/issues/2390)).
+
+- `xerj autoindex remove --root` also deletes indices an aborted or failed
+  build of that folder left behind when the build never wrote a catalog run.
+  The resume journal names the folder and the index names; a catalog walk
+  cannot see them. A cataloged index is left in place — the working copy the
+  abort preserved, and any index another folder still names. `xerj autoindex
+  status` marks a live leftover of any prefix `ORPHAN` and prints the remove
+  command
+  ([#2391](https://github.com/xerj-org/xerj/issues/2391)).
+
+- `xerj mcp`: a proxied tool call whose response body cannot be read in
+  full (the connection drops partway, or the request deadline fires
+  mid-body) is now an error that names the URL and the cause. It used to
+  come back as an empty *successful* result, which reads as "no matches".
+
+- MCP calls to a loopback node (`127.0.0.1`, `localhost`, `::1`) no longer
+  follow `ALL_PROXY`, `HTTP_PROXY`, or `HTTPS_PROXY`. reqwest sends those
+  addresses through the proxy unless the client opts out, so a socks or HTTP
+  proxy in the environment answered HTTP 503 while the node was healthy and
+  `curl --noproxy` reached it. `xerj autoindex`, `xerj search`, `xerj def`,
+  and the other commands that share the node HTTP client skip the proxy for
+  the same hosts. A non-loopback URL still uses the process proxy, including
+  `NO_PROXY`. When a proxy is used and returns HTTP 502, 503, or 504, or the
+  connection to it fails, the tool error names the proxy (`request to …
+  went through proxy http://…, which returned HTTP 503`) instead of
+  `XERJ returned HTTP 503`
+  ([#2379](https://github.com/xerj-org/xerj/issues/2379)).
 
 - `xerj mcp`: `xerj_code_search` now gives up on a node that does not
   answer. Its requests went through a fresh HTTP client without the 30 s
@@ -443,13 +504,13 @@ samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
     [#1170](https://github.com/xerj-org/xerj/issues/1170); the issue stays
     open (PR [#2347](https://github.com/xerj-org/xerj/pull/2347)).
   - What #1170 still does not do: `wait_for_active_shards`; replica
-    promotion (a write still needs the primary); native `/v1` ingest and
-    `_delete_by_query` (they stay on the receiving node); replicating
-    pipelines; moving copies when membership changes; merging aggregations,
-    suggest, collapse, rescore, profile, `search_after` or scroll across
-    owners; node-lifecycle APIs. The snapshot is the command prefix, not
-    the documents, and a history that does not fit in 8 MiB stays in the
-    log.
+    promotion (a write still needs the primary); native `/v1` logs, OTLP,
+    syslog, turbo, and pipeline ingest (they stay on the receiving node);
+    `_reindex`; replicating pipelines; moving copies when membership
+    changes; merging aggregations, suggest, collapse, rescore, profile,
+    `search_after` or scroll across owners; node-lifecycle APIs. The
+    snapshot is the command prefix, not the documents, and a history that
+    does not fit in 8 MiB stays in the log.
 
 - A DeepSeek Harness profile bundle in `dsh/` (`xerj-dsh`, Apache-2.0,
   version `1.0.0-rc.99`) inserts the README's `mcp-xerj` stdio row via
@@ -607,6 +668,14 @@ samuelmbabhazi, elewashy, WYSTAF, kamwoh, mgtf, mariomarcolongo and Jun516.
   report `eta_quality=stalled` when a phase with a known total completes
   nothing (including 0/N), and when a phase with no total has been silent
   for 10 minutes.
+
+- Writing through a multi-index alias follows ES's write-index rule: one
+  backing index, or exactly one member carrying `is_write_index: true`; an
+  ambiguous alias is refused with `illegal_argument_exception` instead of
+  silently writing to the first backing index. The same resolution covers
+  `_bulk` items and the id-addressed GET/HEAD/DELETE, so a document written
+  through the alias is readable through it, and the response `_index` now
+  names the concrete index.
 
 - Semantic `xerj autoindex` against `--embed-mode proxy` resumes after a
   mid-run failure and does not re-embed documents already indexed, when the

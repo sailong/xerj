@@ -370,7 +370,7 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     let (auth, auth_key_file) =
         resolve_auth(auth_override, std::env::var("XERJ_AUTH").ok(), &base_url);
 
-    let client = reqwest::Client::builder()
+    let client = node_http_builder(&base_url)
         .timeout(REQUEST_TIMEOUT)
         .build()?;
 
@@ -398,10 +398,41 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
     }
 
     // stdout is the JSON-RPC channel; stderr is for logs only.
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
+    serve(ctx, BufReader::new(tokio::io::stdin()), tokio::io::stdout()).await
+}
+
+/// The JSON-RPC loop over newline-delimited messages, apart from the process'
+/// stdin/stdout so tests can drive it over an in-memory pipe.
+///
+/// A `tools/call` request runs on its own task, so a call that waits on the
+/// node does not hold up the messages behind it (#2390): `ping`,
+/// `initialize`, `tools/list` and notifications stay inline because they never
+/// wait on anything. Replies are matched by `id`, so they may go out in any
+/// order. `notifications/cancelled` aborts the call it names, and no response
+/// is written for it. Every reply goes through one writer task, so lines never
+/// interleave. At end of input the loop waits for the calls still running and
+/// writes their replies before returning, as the serial loop did.
+async fn serve<R, W>(ctx: Ctx, reader: R, stdout: W) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let ctx = std::sync::Arc::new(ctx);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let writer = tokio::spawn(async move {
+        let mut stdout = stdout;
+        while let Some(msg) = rx.recv().await {
+            write_msg(&mut stdout, &msg).await?;
+        }
+        anyhow::Ok(())
+    });
+    let in_flight = InFlight::default();
+    let mut calls = tokio::task::JoinSet::new();
+    let mut lines = reader.lines();
 
     while let Some(line) = lines.next_line().await? {
+        // Reap finished calls so a long session does not accumulate them.
+        while calls.try_join_next().is_some() {}
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -411,14 +442,19 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
             Ok(v) => v,
             Err(e) => {
                 // Parse error: reply per JSON-RPC (id unknown → null).
-                let resp = rpc_error(Value::Null, -32700, format!("parse error: {e}"));
-                write_msg(&mut stdout, &resp).await?;
+                if tx
+                    .send(rpc_error(Value::Null, -32700, format!("parse error: {e}")))
+                    .is_err()
+                {
+                    break;
+                }
                 continue;
             }
         };
 
         // JSON-RPC allows a batch (array) of messages. MCP 2024-11-05 uses it;
         // 2025-06-18 dropped it. Support both: object → single, array → batch.
+        // A batch keeps the serial handling it always had, one reply per line.
         let responses: Vec<Value> = match parsed {
             Value::Array(batch) => {
                 let mut out = Vec::new();
@@ -429,20 +465,119 @@ pub async fn run(args: &[String]) -> anyhow::Result<()> {
                 }
                 out
             }
+            msg if is_cancellation(&msg) => {
+                if let Some(id) = msg.pointer("/params/requestId") {
+                    in_flight.cancel(id);
+                }
+                Vec::new()
+            }
+            msg if is_tool_call_request(&msg) => {
+                let key = id_key(&msg["id"]);
+                let (ctx, tx, registry) = (ctx.clone(), tx.clone(), in_flight.clone());
+                in_flight.start(&mut calls, key, move |token| async move {
+                    let reply = handle_message(&ctx, msg).await;
+                    // A cancellation that got here first means: say nothing.
+                    if registry.finish(token) {
+                        if let Some(reply) = reply {
+                            let _ = tx.send(reply);
+                        }
+                    }
+                });
+                Vec::new()
+            }
             other => handle_message(&ctx, other).await.into_iter().collect(),
         };
 
-        for resp in responses {
-            write_msg(&mut stdout, &resp).await?;
+        if responses.into_iter().any(|resp| tx.send(resp).is_err()) {
+            break; // the writer stopped: its error is returned below
         }
     }
 
-    Ok(())
+    while calls.join_next().await.is_some() {}
+    drop(tx);
+    writer.await?
+}
+
+fn is_tool_call_request(msg: &Value) -> bool {
+    msg.get("method").and_then(Value::as_str) == Some("tools/call")
+        && msg.get("id").is_some_and(|id| !id.is_null())
+}
+
+fn is_cancellation(msg: &Value) -> bool {
+    msg.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+}
+
+/// A request id as a map key. JSON-RPC ids are strings or numbers and `2` is
+/// not `"2"`, so the key is the id's JSON text.
+fn id_key(id: &Value) -> String {
+    id.to_string()
+}
+
+/// The `tools/call` requests still running, by request id, so a
+/// `notifications/cancelled` can abort the right one.
+#[derive(Clone, Default)]
+struct InFlight(std::sync::Arc<std::sync::Mutex<InFlightCalls>>);
+
+#[derive(Default)]
+struct InFlightCalls {
+    next: u64,
+    by_id: std::collections::HashMap<String, (u64, tokio::task::AbortHandle)>,
+}
+
+/// Which call a task is, so a reused request id cannot finish or cancel
+/// another call.
+struct CallToken {
+    key: String,
+    seq: u64,
+}
+
+impl InFlight {
+    /// Spawn `call` and register it. The lock is held across the spawn, so the
+    /// call cannot finish (and look itself up) before it is registered.
+    fn start<F, Fut>(&self, calls: &mut tokio::task::JoinSet<()>, key: String, call: F)
+    where
+        F: FnOnce(CallToken) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        guard.next += 1;
+        let seq = guard.next;
+        let handle = calls.spawn(call(CallToken {
+            key: key.clone(),
+            seq,
+        }));
+        guard.by_id.insert(key, (seq, handle));
+    }
+
+    /// The call is done: `true` if it should reply, `false` if it was
+    /// cancelled in the meantime.
+    fn finish(&self, token: CallToken) -> bool {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.by_id.get(&token.key) {
+            Some((seq, _)) if *seq == token.seq => {
+                guard.by_id.remove(&token.key);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Abort the running call with this id, if any. An unknown or finished id
+    /// is ignored, as the MCP spec asks.
+    fn cancel(&self, id: &Value) {
+        let mut guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, handle)) = guard.by_id.remove(&id_key(id)) {
+            handle.abort();
+        }
+    }
 }
 
 /// Serialize one JSON-RPC message and write it as a single newline-terminated
 /// line (the MCP stdio framing), then flush.
-async fn write_msg(stdout: &mut tokio::io::Stdout, msg: &Value) -> anyhow::Result<()> {
+async fn write_msg<W>(stdout: &mut W, msg: &Value) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let mut buf = serde_json::to_vec(msg)?;
     buf.push(b'\n');
     stdout.write_all(&buf).await?;
@@ -493,9 +628,14 @@ pub async fn handle_message_for_test(
     auth: Option<String>,
     msg: Value,
 ) -> Option<Value> {
+    let base_url = base_url.trim_end_matches('/').to_string();
+    let client = node_http_builder(&base_url)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("build HTTP client");
     let ctx = Ctx {
-        client: reqwest::Client::new(),
-        base_url: base_url.trim_end_matches('/').to_string(),
+        client,
+        base_url,
         auth,
     };
     handle_message(&ctx, msg).await
@@ -2725,12 +2865,13 @@ impl McpXc {
             .build()
             .map_err(|e| format!("runtime: {e}"))?;
         let url = format!("{}{}", self.base_url, path);
+        let base_url = self.base_url.clone();
         let auth = self.auth.clone();
         let timeout = self.timeout;
         let method = method.to_string();
         let body = body.cloned();
         rt.block_on(async move {
-            let client = reqwest::Client::builder()
+            let client = node_http_builder(&base_url)
                 .timeout(timeout)
                 .build()
                 .map_err(|e| format!("http client: {e}"))?;
@@ -2746,7 +2887,7 @@ impl McpXc {
             let resp = req
                 .send()
                 .await
-                .map_err(|e| format!("no response from {url}: {e}"))?;
+                .map_err(|e| mcp_xc_send_error(&base_url, &url, &e))?;
             // Surface the status WITH the body: the tri-state callers (404 =
             // zero, not error) classify it themselves.
             let status = resp.status().as_u16();
@@ -2755,7 +2896,8 @@ impl McpXc {
             match status {
                 200..=299 => Ok(v),
                 404 => Err("__404__".to_string()),
-                other => Err(format!("HTTP {other}: {v}")),
+                other => Err(proxy_status_failure(&base_url, &url, other, &v.to_string())
+                    .unwrap_or_else(|| format!("HTTP {other}: {v}"))),
             }
         })
     }
@@ -3068,17 +3210,110 @@ async fn fetch_mapping(ctx: &Ctx, index: &str) -> Option<Value> {
     resp.json::<Value>().await.ok()
 }
 
+/// HTTP client for the XERJ node at `base_url`.
+///
+/// A loopback node (`127.0.0.1`, `localhost`, `::1`, and `0.0.0.0` — the
+/// same hosts [`xerj_common::localauth::url_is_loopback`] already treats as
+/// this machine) is never reached through `HTTP_PROXY`, `HTTPS_PROXY`, or
+/// `ALL_PROXY`. reqwest honours those for `127.0.0.1` unless told not to,
+/// and a proxy that cannot connect to loopback answers HTTP 503 while the
+/// node is healthy (#2379). A non-loopback URL keeps the process proxy
+/// settings, including `NO_PROXY`.
+pub(crate) fn node_http_builder(base_url: &str) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    if xerj_common::localauth::url_is_loopback(base_url) {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
+
+/// Proxy reqwest will use for `base_url`, with userinfo removed.
+///
+/// `None` for loopback (the client is built with [`node_http_builder`], which
+/// disables proxies) and when `NO_PROXY` excludes the host. This is
+/// `hyper_util`'s env matcher, the one reqwest installs — scheme-specific
+/// `HTTP_PROXY` / `HTTPS_PROXY` win over `ALL_PROXY`.
+fn env_proxy_label(base_url: &str) -> Option<String> {
+    if xerj_common::localauth::url_is_loopback(base_url) {
+        return None;
+    }
+    let uri = base_url.parse::<http::Uri>().ok()?;
+    let intercept = hyper_util::client::proxy::matcher::Matcher::from_env().intercept(&uri)?;
+    Some(redact_proxy(intercept.uri()))
+}
+
+/// `http://proxy:8080`, never `http://user:secret@proxy:8080`.
+fn redact_proxy(uri: &http::Uri) -> String {
+    let scheme = uri.scheme_str().unwrap_or("http");
+    let Some(authority) = uri.authority() else {
+        return uri.to_string();
+    };
+    let host_port = authority
+        .as_str()
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority.as_str());
+    format!("{scheme}://{host_port}")
+}
+
+/// `Some` when this status arrived through an env proxy and is one a proxy
+/// generates when it cannot reach the upstream (502, 503, 504). The text
+/// names the proxy. A 401 or 400 stays the node's own sentence.
+pub(crate) fn proxy_status_failure(
+    base_url: &str,
+    request_url: &str,
+    status: u16,
+    body: &str,
+) -> Option<String> {
+    if !matches!(status, 502..=504) {
+        return None;
+    }
+    let proxy = env_proxy_label(base_url)?;
+    Some(proxy_gateway_message(request_url, &proxy, status, body))
+}
+
+fn proxy_gateway_message(request_url: &str, proxy: &str, status: u16, body: &str) -> String {
+    format!(
+        "request to {request_url} went through proxy {proxy}, which returned HTTP {status}: {body}"
+    )
+}
+
 /// Tool text for a proxy request that never got an HTTP response.
 ///
 /// A connect failure means nothing accepted a connection at `XERJ_URL`
 /// (#2079). The raw client error does not say so, and agents then drop xerj
 /// for the session. HTTP statuses never reach here: a 401 is a response and
 /// stays `XERJ returned HTTP 401: …`.
+///
+/// A failure that went through an env proxy names that proxy instead (#2379).
+/// Connection refused on the proxy is not "no node is listening".
+/// `McpXc` keeps the "no response" wording `xerj_code_search` tests for when
+/// the node accepts and then stays silent. A refused connect still goes
+/// through [`transport_failure_text`], so a dead proxy is not reported as a
+/// dead node.
+fn mcp_xc_send_error(base_url: &str, request_url: &str, err: &reqwest::Error) -> String {
+    if err.is_timeout() {
+        let detail = error_detail(err);
+        return match env_proxy_label(base_url) {
+            Some(proxy) => format!("no response from {request_url} via proxy {proxy}: {detail}"),
+            None => format!("no response from {request_url}: {detail}"),
+        };
+    }
+    transport_failure_text(base_url, request_url, err)
+}
+
 pub(crate) fn transport_failure_text(
     base_url: &str,
     request_url: &str,
     err: &reqwest::Error,
 ) -> String {
+    if let Some(proxy) = env_proxy_label(base_url) {
+        return format!(
+            "request to {request_url} failed via proxy {proxy}: {}",
+            error_detail(err)
+        );
+    }
     if node_unreachable(err) {
         node_not_listening(base_url, &error_detail(err))
     } else {
@@ -3278,7 +3513,21 @@ async fn engine_request(
     match req.send().await {
         Ok(resp) => {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            // The status line arrived, but the body may still fail (the
+            // connection drops, the request deadline fires mid-body). An empty
+            // string here would turn that into an empty *successful* result.
+            let text = match resp.text().await {
+                Ok(text) => text,
+                Err(e) => {
+                    return tool_text(
+                        format!(
+                            "XERJ returned HTTP {status}, but the response body from {url} \
+                             could not be read: {e}"
+                        ),
+                        true,
+                    );
+                }
+            };
             if status.is_success() {
                 let text = match demote_page {
                     Some(page) => {
@@ -3301,9 +3550,17 @@ async fn engine_request(
             } else if is_memory_store_path(path) {
                 if let Some(explained) = memory_flood_tool_text(ctx, &text).await {
                     tool_text(explained, true)
+                } else if let Some(proxied) =
+                    proxy_status_failure(&ctx.base_url, &url, status.as_u16(), &text)
+                {
+                    tool_text(proxied, true)
                 } else {
                     tool_text(format!("XERJ returned HTTP {status}: {text}"), true)
                 }
+            } else if let Some(proxied) =
+                proxy_status_failure(&ctx.base_url, &url, status.as_u16(), &text)
+            {
+                tool_text(proxied, true)
             } else {
                 tool_text(format!("XERJ returned HTTP {status}: {text}"), true)
             }
@@ -3323,6 +3580,35 @@ mod tests {
     fn built(r: Result<BuiltRequest, String>) -> (Method, String, Value) {
         let (m, p, b) = r.unwrap();
         (m, p, b.expect("builder should carry a body"))
+    }
+
+    /// #2379: a proxy 503 names the proxy. A node 400 does not, because that
+    /// status is not one a proxy synthesises on the way to the upstream.
+    #[test]
+    fn proxy_status_failure_names_the_proxy_only_for_gateway_statuses() {
+        let url = "http://node.example:9200/docs/_search";
+        let proxy = "http://proxy.internal:8888";
+        let msg = proxy_gateway_message(url, proxy, 503, "upstream");
+        // The env matcher is covered by tests/loopback_proxy.rs. This pins
+        // the sentence, and that a loopback target and a node 400 are not
+        // rewritten into it.
+        assert!(msg.contains(proxy), "{msg}");
+        assert!(msg.contains("HTTP 503"), "{msg}");
+        assert!(msg.contains("went through proxy"), "{msg}");
+        assert!(!msg.contains("XERJ returned"), "{msg}");
+        assert!(proxy_status_failure("http://127.0.0.1:9200", url, 503, "x").is_none());
+        assert!(proxy_status_failure("http://node.example:9200", url, 400, "nope").is_none());
+    }
+
+    #[test]
+    fn proxy_label_drops_userinfo() {
+        let uri: http::Uri = "http://user:secret@proxy.internal:8888".parse().unwrap();
+        let label = redact_proxy(&uri);
+        assert_eq!(label, "http://proxy.internal:8888");
+        assert!(!label.contains("secret"), "{label}");
+        assert!(!label.contains("user"), "{label}");
+        let socks: http::Uri = "socks5://127.0.0.1:1080".parse().unwrap();
+        assert_eq!(redact_proxy(&socks), "socks5://127.0.0.1:1080");
     }
 
     /// `xerj_code_search` talks to the node through `McpXc`, not `Ctx.client`,
@@ -3481,6 +3767,176 @@ mod tests {
             let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, header.as_bytes()).await;
             let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body.as_bytes()).await;
         });
+    }
+
+    /// A node that accepts every connection and never sends a byte.
+    async fn silent_node() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// `serve` over in-memory pipes: the client's stdin writer and the lines
+    /// the server writes to its stdout.
+    fn stdio_session(
+        base_url: String,
+        timeout: Duration,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::Lines<BufReader<tokio::io::DuplexStream>>,
+    ) {
+        let (client_in, server_in) = tokio::io::duplex(64 * 1024);
+        let (server_out, client_out) = tokio::io::duplex(64 * 1024);
+        let ctx = Ctx {
+            client: reqwest::Client::builder().timeout(timeout).build().unwrap(),
+            base_url,
+            auth: None,
+        };
+        tokio::spawn(serve(ctx, BufReader::new(server_in), server_out));
+        (client_in, BufReader::new(client_out).lines())
+    }
+
+    async fn send_line(stdin: &mut tokio::io::DuplexStream, msg: Value) {
+        stdin
+            .write_all(format!("{msg}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    fn stalled_search(id: u64) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+            "name": "xerj_search", "arguments": {"index": "docs", "query": "retry"}}})
+    }
+
+    /// #2390: a tool call waiting on a stalled node must not hold up `ping`.
+    #[tokio::test]
+    async fn ping_is_answered_while_a_tool_call_waits_on_the_node() {
+        let (mut stdin, mut stdout) = stdio_session(silent_node().await, Duration::from_secs(3));
+        send_line(&mut stdin, stalled_search(2)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send_line(
+            &mut stdin,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+        )
+        .await;
+        let line = tokio::time::timeout(Duration::from_secs(1), stdout.next_line())
+            .await
+            .expect("no reply within 1 s: ping queued behind the stalled tool call")
+            .unwrap()
+            .unwrap();
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["id"], 3, "{reply}");
+        assert_eq!(reply["result"], json!({}), "{reply}");
+    }
+
+    /// End of input still answers the calls that were running, then closes
+    /// stdout: the serial loop always replied before it returned.
+    #[tokio::test]
+    async fn end_of_input_waits_for_running_calls_and_answers_them() {
+        let (mut stdin, mut stdout) =
+            stdio_session(silent_node().await, Duration::from_millis(300));
+        send_line(&mut stdin, stalled_search(2)).await;
+        drop(stdin);
+        let mut replies = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Ok(Some(line)) = stdout.next_line().await {
+                replies.push(serde_json::from_str::<Value>(&line).unwrap());
+            }
+        })
+        .await
+        .expect("stdout was not closed after the last reply");
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0]["id"], 2, "{replies:?}");
+        assert_eq!(replies[0]["result"]["isError"], true, "{replies:?}");
+    }
+
+    /// A batch keeps its old shape: each request answered on its own line.
+    #[tokio::test]
+    async fn a_batch_is_answered_one_line_per_request() {
+        let (mut stdin, mut stdout) =
+            stdio_session(silent_node().await, Duration::from_millis(300));
+        send_line(
+            &mut stdin,
+            json!([{"jsonrpc": "2.0", "id": 5, "method": "ping"},
+                   {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                   {"jsonrpc": "2.0", "id": 6, "method": "ping"}]),
+        )
+        .await;
+        drop(stdin);
+        let mut ids = Vec::new();
+        while let Ok(Some(line)) = stdout.next_line().await {
+            ids.push(serde_json::from_str::<Value>(&line).unwrap()["id"].clone());
+        }
+        assert_eq!(ids, vec![json!(5), json!(6)]);
+    }
+
+    /// #2390: `notifications/cancelled` stops the request it names, and no
+    /// response is written for it, even after the request would have finished.
+    #[tokio::test]
+    async fn a_cancelled_tool_call_gets_no_response() {
+        // The search would end after two 500 ms deadlines (mapping, then search).
+        let (mut stdin, mut stdout) =
+            stdio_session(silent_node().await, Duration::from_millis(500));
+        send_line(&mut stdin, stalled_search(2)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send_line(
+            &mut stdin,
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                   "params": {"requestId": 2, "reason": "test"}}),
+        )
+        .await;
+        send_line(
+            &mut stdin,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+        )
+        .await;
+        let mut ids = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_millis(2500), async {
+            while let Ok(Some(line)) = stdout.next_line().await {
+                ids.push(serde_json::from_str::<Value>(&line).unwrap()["id"].clone());
+            }
+        })
+        .await;
+        assert!(ids.contains(&json!(3)), "ping was not answered: {ids:?}");
+        assert!(
+            !ids.contains(&json!(2)),
+            "the cancelled call was answered: {ids:?}"
+        );
+    }
+
+    /// A 200 whose body cannot be read in full (the connection drops partway,
+    /// or the request deadline fires mid-body) is a failure, not an empty
+    /// successful result: an agent reading `isError: false` with no text would
+    /// conclude the query matched nothing.
+    #[tokio::test]
+    async fn engine_request_reports_a_body_that_could_not_be_read() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await;
+            // Promise 100 bytes, send 12, hang up.
+            let reply = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Type: application/json\r\n\r\n{\"hits\":{\"to";
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, reply.as_bytes()).await;
+        });
+        let ctx = Ctx {
+            client: reqwest::Client::new(),
+            base_url: format!("http://{addr}"),
+            auth: None,
+        };
+        let res = engine_request(&ctx, Method::Get, "/docs/_search", None, None, None, None).await;
+        assert_eq!(res["isError"], true, "{res}");
+        let text = res["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("could not be read"), "{text}");
     }
 
     /// #2284: the server already explained the flood-stage block. The tool
