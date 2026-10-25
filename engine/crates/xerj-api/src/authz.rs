@@ -367,6 +367,54 @@ pub fn visibility_for(principal: &Principal) -> Arc<dyn IndexVisibility> {
     Arc::new(PrincipalVisibility(principal.clone()))
 }
 
+struct RequestVisibility {
+    principal: PrincipalVisibility,
+    aliases: Arc<dashmap::DashMap<String, Vec<String>>>,
+    demands: Vec<Demand>,
+}
+
+impl IndexVisibility for RequestVisibility {
+    fn visible(&self, index: &str) -> bool {
+        if !self.principal.visible(index) {
+            return false;
+        }
+        let mut matched = self.demands.is_empty();
+        for (expr, privilege) in &self.demands {
+            let targets_index = if expression_matches(expr, index) {
+                true
+            } else if !is_pattern(expr) {
+                // get_index can already hold this shard's read lock; never wait on it.
+                match self.aliases.try_get(expr) {
+                    dashmap::try_result::TryResult::Present(alias) => {
+                        alias.value().iter().any(|target| target == index)
+                    }
+                    dashmap::try_result::TryResult::Absent => false,
+                    dashmap::try_result::TryResult::Locked => return false,
+                }
+            } else {
+                false
+            };
+            if targets_index {
+                matched = true;
+                if !self.principal.0.allows_index(index, *privilege) {
+                    return false;
+                }
+            }
+        }
+        // Derived targets (for example a rollover backing index) still need
+        // every action this request performs, rather than any held privilege.
+        matched
+            || self
+                .demands
+                .iter()
+                .all(|(_, privilege)| self.principal.0.allows_index(index, *privilege))
+    }
+}
+
+fn expression_matches(expression: &str, name: &str) -> bool {
+    expression == "_all" || crate::es_compat::glob_match_simple(expression, name)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Request classification
 // ─────────────────────────────────────────────────────────────────────────────
@@ -551,7 +599,7 @@ fn split_expressions(s: &str) -> Vec<String> {
     s.split(',')
         .map(str::trim)
         .filter(|e| !e.is_empty())
-        .map(String::from)
+        .map(crate::es_compat::resolve_date_math_index)
         .collect()
 }
 
@@ -639,8 +687,10 @@ enum BodyShape {
     /// `_bulk` NDJSON: `{"index"|"create"|"update"|"delete": {"_index": …}}`.
     Bulk,
     /// `_msearch` / `_msearch/template` NDJSON header lines: `{"index": …}`,
-    /// where the value may be a string or an array of strings.
+    /// using the same header fallback as the executing handler.
     MsearchHeaders,
+    /// `/_sql`: the parsed SQL statement names the table to read.
+    Sql,
     /// `_mget`: `{"docs": [{"_index": …}]}`.
     MgetDocs,
     /// `POST /_aliases`: `{"actions": [{"add"|"remove"|"remove_index": …}]}`.
@@ -729,6 +779,9 @@ fn body_shape(method: &Method, segs: &[String]) -> BodyShape {
     }
     if first == "_reindex" {
         return BodyShape::Reindex;
+    }
+    if first == "_sql" && segs.len() == 1 {
+        return BodyShape::Sql;
     }
     if first == "_snapshot" {
         return BodyShape::SnapshotIndices;
@@ -856,23 +909,10 @@ fn body_targets(
                     return Err(unresolvable(principal, "multi-search header lines"));
                 };
                 if expect_header {
-                    match parsed.get("index") {
-                        Some(Value::String(s)) => out.push((s.clone(), Privilege::ReadIndex)),
-                        Some(Value::Array(items)) => {
-                            for i in items {
-                                if let Some(s) = i.as_str() {
-                                    out.push((s.to_string(), Privilege::ReadIndex));
-                                }
-                            }
-                        }
-                        // A header that names no index means "the path index,
-                        // else every index" — the latter is answered over the
-                        // visible set, so nothing to demand here.
-                        _ => {
-                            if let Some(d) = default_index {
-                                out.push((d.to_string(), Privilege::ReadIndex));
-                            }
-                        }
+                    let expression =
+                        crate::es_compat::msearch_index_expression(&parsed, default_index);
+                    for index in split_expressions(expression) {
+                        out.push((index, Privilege::ReadIndex));
                     }
                 } else {
                     // The search body half — it can still carry a terms lookup.
@@ -981,6 +1021,13 @@ fn body_targets(
                 }
             }
         }
+        BodyShape::Sql => {
+            if let Ok(parsed) = serde_json::from_slice::<crate::es_compat::SqlQueryBody>(body) {
+                if let Ok(query) = xerj_engine::sql::parse_sql(&parsed.query) {
+                    out.push((query.index, Privilege::ReadIndex));
+                }
+            }
+        }
         BodyShape::Query => {
             if let Ok(parsed) = serde_json::from_slice::<Value>(body) {
                 collect_query_body_indices(&parsed, &mut out);
@@ -1018,6 +1065,9 @@ fn body_targets(
         }
         // Patterns, not names — `authorize_template_patterns` handles them.
         BodyShape::IndexTemplate => {}
+    }
+    for (expression, _) in &mut out {
+        *expression = crate::es_compat::resolve_date_math_index(expression);
     }
     // A bulk usually names two or three indices across a million action lines.
     out.sort_by(|a, b| a.0.cmp(&b.0).then(rank(a.1).cmp(&rank(b.1))));
@@ -1161,11 +1211,28 @@ fn collect_query_body_indices(q: &Value, out: &mut Vec<Demand>) {
 /// the decision and the read.
 pub trait AliasResolver {
     fn targets(&self, name: &str) -> Option<Vec<String>>;
+
+    /// Existing concrete targets of a pattern, before principal filtering.
+    fn matching_indices(&self, _expression: &str) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 impl AliasResolver for AppState {
     fn targets(&self, name: &str) -> Option<Vec<String>> {
         self.engine.aliases.get(name).map(|e| e.value().clone())
+    }
+
+    fn matching_indices(&self, expression: &str) -> Vec<String> {
+        let mut indices: Vec<String> = self
+            .engine
+            .index_name_list()
+            .into_iter()
+            .filter(|index| expression_matches(expression, index))
+            .collect();
+        indices.sort();
+        indices.dedup();
+        indices
     }
 }
 
@@ -1189,7 +1256,7 @@ impl AliasResolver for NoAliases {
 enum PatternExpansion {
     /// The name is resolved through `Engine::get_index` / `list_indices` /
     /// `index_name_list`, so a wildcard is expanded over what this principal
-    /// may see and needs no decision of its own.
+    /// may see; each visible target must also permit the requested action.
     Guarded,
     /// The handler acts on the expression itself, outside that funnel — a
     /// wildcard authorized here is a wildcard executed.
@@ -1212,17 +1279,15 @@ fn expansion_for(shape: BodyShape) -> PatternExpansion {
 
 /// Authorize one index expression, resolving aliases first.
 ///
-/// Under [`PatternExpansion::Guarded`] a pattern is *not* refused: it is
-/// expanded over the principal's visible set by the engine (see
-/// [`xerj_engine::index_guard`]), so a granted `logs-*` works and an ungranted
-/// `*` silently resolves to nothing instead of leaking what it would have
-/// matched.
+/// Guarded patterns expand over the visible set, but visibility alone is not
+/// permission to perform this action. Check every visible target before the
+/// handler can mutate anything; the request guard repeats the action check at
+/// resolution time, including aliases changed after this decision.
 ///
 /// Under [`PatternExpansion::Unguarded`] that reasoning does not hold, so a
 /// pattern that [`may_reach_reserved`] is decided here, on the same terms as an
-/// index template's `index_patterns`: only a principal explicitly *granted* the
-/// pattern may use it. Anything narrower (`logs-*`) still passes — it cannot
-/// name a brain, and refusing it would cost the ordinary per-tenant backup.
+/// index template's `index_patterns`: a scoped principal must hold the pattern
+/// itself, since restored indices need not exist on this node yet.
 fn authorize_expression(
     principal: &Principal,
     aliases: &dyn AliasResolver,
@@ -1231,7 +1296,16 @@ fn authorize_expression(
     expansion: PatternExpansion,
 ) -> Result<(), Response> {
     if is_pattern(expr) {
-        if expansion == PatternExpansion::Guarded || !may_reach_reserved(expr) {
+        if expansion == PatternExpansion::Guarded {
+            let visible = PrincipalVisibility(principal.clone());
+            for index in aliases.matching_indices(expr) {
+                if visible.visible(&index) {
+                    authorize_index(principal, &index, privilege)?;
+                }
+            }
+            return Ok(());
+        }
+        if matches!(principal, Principal::Unscoped { .. }) && !may_reach_reserved(expr) {
             return Ok(());
         }
         // `Unscoped::allows_index` answers "not reserved" for the literal text
@@ -1370,20 +1444,27 @@ pub async fn authz_middleware(State(state): State<AppState>, req: Request, next:
         return refused(guest_forbidden(&principal, &path));
     }
 
-    if let Err(denied) = decide(&principal, &method, &segs, &target, shape, &body, &state) {
-        let denied = refused(denied);
-        return if principal.is_share_guest() {
-            crate::share::no_store(denied)
-        } else {
-            denied
-        };
-    }
+    let demands = match decide(&principal, &method, &segs, &target, shape, &body, &state) {
+        Ok(demands) => demands,
+        Err(denied) => {
+            let denied = refused(denied);
+            return if principal.is_share_guest() {
+                crate::share::no_store(denied)
+            } else {
+                denied
+            };
+        }
+    };
 
     // Layer 2: whatever the handler resolves from here on — including names
     // this module never parsed — is checked against the same principal at the
     // engine's index funnel.
-    let response =
-        xerj_engine::index_guard::scoped(visibility_for(&principal), next.run(req)).await;
+    let guard = Arc::new(RequestVisibility {
+        principal: PrincipalVisibility(principal.clone()),
+        aliases: Arc::clone(&state.engine.aliases),
+        demands,
+    });
+    let response = xerj_engine::index_guard::scoped(guard, next.run(req)).await;
     let response = prune_response(response, &segs, &principal, &state).await;
     // What a guest reads is somebody's documents, and the road to the guest
     // may run through a tunnel or a proxy the owner does not operate. Nothing
@@ -1549,35 +1630,40 @@ fn decide(
     shape: BodyShape,
     body: &[u8],
     aliases: &dyn AliasResolver,
-) -> Result<(), Response> {
+) -> Result<Vec<Demand>, Response> {
     // Restated here and not only in the middleware, so this function is a
     // complete decision on its own and cannot deny the local-dev superuser if
     // it is ever called from somewhere else.
     if principal.is_superuser() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if matches!(principal, Principal::Denied) {
         return Err(forbidden(principal, "<cluster>", Privilege::ReadIndex));
     }
     match target {
-        Target::Exempt => Ok(()),
+        Target::Exempt => Ok(Vec::new()),
         Target::Brain(brain) => {
-            authorize_brain(principal, brain, reserved_api_privilege(method, segs))
+            authorize_brain(principal, brain, reserved_api_privilege(method, segs))?;
+            Ok(Vec::new())
         }
         Target::Memory(ns) => {
-            authorize_memory_namespace(principal, ns, reserved_api_privilege(method, segs))
+            authorize_memory_namespace(principal, ns, reserved_api_privilege(method, segs))?;
+            Ok(Vec::new())
         }
-        Target::MemoryRoot => Ok(()),
+        Target::MemoryRoot => Ok(Vec::new()),
         Target::Indices(expressions, op_start) => {
             let privilege = required_privilege(method, segs, *op_start);
-            for expr in expressions {
-                authorize_expression(
-                    principal,
-                    aliases,
-                    expr,
-                    privilege,
-                    PatternExpansion::Guarded,
-                )?;
+            let mut demands: Vec<Demand> = expressions
+                .iter()
+                .map(|expr| (expr.clone(), privilege))
+                .collect();
+            if matches!(
+                segs.get(*op_start).map(String::as_str),
+                Some("_clone" | "_shrink" | "_split")
+            ) {
+                if let Some(target) = segs.get(op_start + 1) {
+                    demands.push((target.clone(), Privilege::AdminIndex));
+                }
             }
             // `PUT|DELETE /{index}/_alias/{alias}` mints or drops an alias
             // name; the name itself is a resource, or the reserved namespace
@@ -1590,7 +1676,17 @@ fn decide(
             // The path index is the default for a body that may override it —
             // `/{index}/_bulk`, `/{index}/_msearch`, `/{index}/_mget`.
             let default = expressions.first().map(String::as_str);
-            authorize_body(principal, aliases, shape, body, default)
+            demands.extend(body_targets(principal, shape, body, default)?);
+            for (expr, privilege) in &demands {
+                authorize_expression(
+                    principal,
+                    aliases,
+                    expr,
+                    *privilege,
+                    PatternExpansion::Guarded,
+                )?;
+            }
+            Ok(demands)
         }
         Target::Cluster => {
             // `/_xerj/*` is the node's own operator namespace, and its first
@@ -1626,6 +1722,22 @@ fn decide(
                 authorize_template_patterns(principal, body)?;
             }
             let mut demands = body_targets(principal, shape, body, None)?;
+            // These unnamed data reads have the same targets as `/*/_search`.
+            if segs.len() == 1
+                && matches!(
+                    segs[0].as_str(),
+                    "_search"
+                        | "_count"
+                        | "_field_caps"
+                        | "_search_shards"
+                        | "_knn_search"
+                        | "_terms_enum"
+                        | "_async_search"
+                        | "_pit"
+                )
+            {
+                demands.push(("*".to_string(), Privilege::ReadIndex));
+            }
             if restoring {
                 // A restore overwrites the indices it names.
                 for demand in demands.iter_mut() {
@@ -1652,14 +1764,14 @@ fn decide(
                 // answered over the principal's visible set, so a scoped key
                 // gets a filtered cluster rather than a blanket 403 — which is
                 // what Kibana needs to function at all.
-                return Ok(());
+                return Ok(demands);
             }
             if !demands.is_empty() {
                 // A mutating cluster verb that named its targets: they are all
                 // authorized above. `POST /_bulk`, `/_reindex` and `/_aliases`
                 // live here — the global bulk is the default write path for
                 // essentially every ES client.
-                return Ok(());
+                return Ok(demands);
             }
             if shape == BodyShape::MlConfig {
                 // An ML config that named no index inherits one that was
@@ -1668,13 +1780,13 @@ fn decide(
                 // names-nothing branch below would 403 a scoped key for the
                 // ordinary `PUT /_ml/datafeeds/{id} {"job_id": …}`, which
                 // reaches nothing this principal was not already granted.
-                return Ok(());
+                return Ok(demands);
             }
             match principal {
                 // A cluster-level mutation that names nothing: an unscoped key
                 // keeps its historical reach over the general surface, a scoped
                 // one has to name what it is changing.
-                Principal::Unscoped { .. } => Ok(()),
+                Principal::Unscoped { .. } => Ok(demands),
                 _ => Err(forbidden(
                     principal,
                     "<cluster>",
@@ -1683,20 +1795,6 @@ fn decide(
             }
         }
     }
-}
-
-/// Authorize the indices a request's body names, if any.
-fn authorize_body(
-    principal: &Principal,
-    aliases: &dyn AliasResolver,
-    shape: BodyShape,
-    body: &[u8],
-    default_index: Option<&str>,
-) -> Result<(), Response> {
-    for (expr, privilege) in body_targets(principal, shape, body, default_index)? {
-        authorize_expression(principal, aliases, &expr, privilege, expansion_for(shape))?;
-    }
-    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2446,7 +2544,7 @@ mod tests {
             ("POST", "/_count", BodyShape::Query),
             ("POST", "/logs/_delete_by_query", BodyShape::Query),
             ("POST", "/logs/_update_by_query", BodyShape::Query),
-            ("POST", "/_sql", BodyShape::Query),
+            ("POST", "/_sql", BodyShape::Sql),
             ("POST", "/logs/_eql/search", BodyShape::Query),
             // Opaque document bodies: nothing in them is an index name.
             ("PUT", "/logs/_doc/1", BodyShape::None),
@@ -3439,5 +3537,116 @@ mod tests {
 
         let denied = visibility_for(&Principal::Denied);
         assert!(!denied.visible("logs-2026"));
+    }
+
+    #[test]
+    fn wildcard_authorization_checks_the_action_on_each_visible_target() {
+        struct Inventory;
+        impl AliasResolver for Inventory {
+            fn targets(&self, _: &str) -> Option<Vec<String>> {
+                None
+            }
+            fn matching_indices(&self, expression: &str) -> Vec<String> {
+                ["logs-a", "logs-b"]
+                    .into_iter()
+                    .filter(|index| expression_matches(expression, index))
+                    .map(String::from)
+                    .collect()
+            }
+        }
+        let reader = scoped(&["logs-a"], &[Privilege::ReadIndex]);
+        assert!(check_with(
+            &reader,
+            Method::POST,
+            "/logs-*/_search",
+            "{}",
+            &Inventory
+        ));
+        assert!(!check_with(
+            &reader,
+            Method::POST,
+            "/logs-*/_delete_by_query",
+            "{}",
+            &Inventory
+        ));
+        assert!(!check_with(
+            &reader,
+            Method::PUT,
+            "/logs-*/_settings",
+            "{}",
+            &Inventory
+        ));
+        let writer = scoped(&["logs-a"], &[Privilege::WriteIndex]);
+        assert!(!check_with(
+            &writer,
+            Method::POST,
+            "/logs-*/_search",
+            "{}",
+            &Inventory
+        ));
+        assert!(check_with(
+            &writer,
+            Method::POST,
+            "/logs-*/_delete_by_query",
+            "{}",
+            &Inventory
+        ));
+        assert!(check_with(
+            &reader,
+            Method::POST,
+            "/absent-*/_search",
+            "{}",
+            &Inventory
+        ));
+        for uri in ["/_snapshot/repo/snap", "/_snapshot/repo/snap/_restore"] {
+            assert!(!check(
+                &reader,
+                Method::POST,
+                uri,
+                r#"{"indices":"logs-*"}"#
+            ));
+        }
+    }
+
+    #[test]
+    fn request_visibility_keeps_mixed_actions_and_rechecks_rebound_aliases() {
+        let principal = Principal::Scoped {
+            key_id: "mixed".into(),
+            roles: vec![
+                Role::new(
+                    "reader",
+                    HashSet::from([Privilege::ReadIndex]),
+                    vec!["source-a".into()],
+                ),
+                Role::new(
+                    "writer",
+                    HashSet::from([Privilege::WriteIndex]),
+                    vec!["dest-a".into()],
+                ),
+            ],
+        };
+        let aliases = Arc::new(dashmap::DashMap::new());
+        aliases.insert("source".into(), vec!["source-a".into()]);
+        let guard = RequestVisibility {
+            principal: PrincipalVisibility(principal),
+            aliases: Arc::clone(&aliases),
+            demands: vec![
+                ("source".into(), Privilege::ReadIndex),
+                ("dest-a".into(), Privilege::WriteIndex),
+            ],
+        };
+        assert!(guard.visible("source-a"));
+        assert!(guard.visible("dest-a"));
+        assert!(!guard.visible("other-a"));
+        aliases.insert("source".into(), vec!["dest-a".into()]);
+        assert!(
+            !guard.visible("dest-a"),
+            "a rebound read alias cannot borrow the destination's write grant"
+        );
+        let _writer = aliases.get_mut("source").unwrap();
+        assert!(
+            !guard.visible("dest-a"),
+            "alias contention must refuse without waiting"
+        );
     }
 }

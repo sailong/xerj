@@ -690,3 +690,367 @@ async fn grants_survive_a_restart() {
         "the boundary must survive restart, got {status}: {resp}"
     );
 }
+
+async fn wildcard_auth_fixture() -> (axum::Router, tempfile::TempDir, String, String, String) {
+    let (state, dir) = auth_enabled_state();
+    let app = build_es_compat_router(state);
+    let admin = format!("ApiKey {ADMIN_KEY}");
+    for index in ["audit-a", "other-a"] {
+        let (status, body) = send(
+            &app,
+            "PUT",
+            &format!("/{index}/_doc/1?refresh=true"),
+            &admin,
+            r#"{"message":"original"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let reader = mint(&app, &admin, r#"{"name":"reader","role_descriptors":{"r":{"indices":[{"names":["audit-a"],"privileges":["read"]}]}}}"#).await;
+    let writer = mint(&app, &admin, r#"{"name":"writer","role_descriptors":{"r":{"indices":[{"names":["audit-a"],"privileges":["write"]}]}}}"#).await;
+    (app, dir, admin, reader, writer)
+}
+
+#[tokio::test]
+async fn wildcard_authorization_refuses_read_only_mutations_before_any_change() {
+    let (app, _dir, admin, reader, _) = wildcard_auth_fixture().await;
+    let (_, settings_before) = send(&app, "GET", "/audit-a/_settings", &admin, "").await;
+    for (method, uri, body) in [
+        (
+            "POST",
+            "/audit-*/_delete_by_query",
+            r#"{"query":{"match_all":{}}}"#,
+        ),
+        (
+            "POST",
+            "/audit-*/_update_by_query",
+            r#"{"script":{"source":"ctx._source.message = 'changed'"},"query":{"match_all":{}}}"#,
+        ),
+        (
+            "PUT",
+            "/audit-*/_settings",
+            r#"{"index":{"number_of_replicas":7}}"#,
+        ),
+        (
+            "POST",
+            "/_bulk",
+            "{\"delete\":{\"_index\":\"audit-*\",\"_id\":\"1\"}}\n",
+        ),
+    ] {
+        let (status, response) = send(&app, method, uri, &reader, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {response}");
+        let (status, doc) = send(&app, "GET", "/audit-a/_doc/1", &admin, "").await;
+        assert_eq!(status, StatusCode::OK, "{doc}");
+        assert_eq!(doc["_source"]["message"], "original");
+        let (_, settings_after) = send(&app, "GET", "/audit-a/_settings", &admin, "").await;
+        assert_eq!(settings_before, settings_after);
+    }
+}
+
+#[tokio::test]
+async fn wildcard_authorization_refuses_write_only_reads_including_global_queries() {
+    let (app, _dir, _, _, writer) = wildcard_auth_fixture().await;
+    for uri in ["/audit-*/_search", "/_all/_search", "/_search", "/_count"] {
+        let (status, body) =
+            send(&app, "POST", uri, &writer, r#"{"query":{"match_all":{}}}"#).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+    }
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/_msearch",
+        &writer,
+        "{\"index\":\"audit-*\"}\n{\"query\":{\"match_all\":{}}}\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn wildcard_authorization_preserves_scoped_reads_and_mixed_reindex() {
+    let (app, _dir, admin, reader, _) = wildcard_auth_fixture().await;
+    for uri in ["/audit-*/_search", "/_all/_search", "/_search"] {
+        let (status, body) =
+            send(&app, "POST", uri, &reader, r#"{"query":{"match_all":{}}}"#).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let hits = body["hits"]["hits"].as_array().expect("hits");
+        assert_eq!(hits.len(), 1, "{body}");
+        assert_eq!(hits[0]["_index"], "audit-a");
+    }
+    let copier = mint(&app, &admin, r#"{"name":"copier","role_descriptors":{"r":{"indices":[{"names":["audit-a"],"privileges":["read"]},{"names":["copied-a"],"privileges":["write"]}]}}}"#).await;
+    let (status, body) = send(&app, "PUT", "/audit-a/_alias/audit-source", &admin, "{}").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/_reindex?refresh=true",
+        &copier,
+        r#"{"source":{"index":"audit-source"},"dest":{"index":"copied-a"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, doc) = send(&app, "GET", "/copied-a/_doc/1", &admin, "").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    assert_eq!(doc["_source"]["message"], "original");
+
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/_reindex",
+        &copier,
+        r#"{"source":{"index":"copied-*"},"dest":{"index":"copied-a"}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn wildcard_authorization_msearch_uses_the_executed_header_target() {
+    let (app, _dir, _, reader, writer) = wildcard_auth_fixture().await;
+    for header in [
+        r#"{"index":[]}"#,
+        r#"{"index":["other-a"]}"#,
+        r#"{"index":[1]}"#,
+        r#"{"index":null}"#,
+        r#"{"index":""}"#,
+        r#"{"index":", "}"#,
+        r#"{}"#,
+    ] {
+        for (op, query) in [
+            ("_msearch", r#"{"query":{"match_all":{}}}"#),
+            (
+                "_msearch/template",
+                r#"{"source":{"query":{"match_all":{}}}}"#,
+            ),
+        ] {
+            let payload = format!("{header}\n{query}\n");
+            let (status, body) = send(&app, "POST", &format!("/{op}"), &writer, &payload).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{op} {header}: {body}");
+            let (status, body) =
+                send(&app, "POST", &format!("/audit-a/{op}"), &reader, &payload).await;
+            assert_eq!(status, StatusCode::OK, "{op} {header}: {body}");
+            let hits = body["responses"][0]["hits"]["hits"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{op} {header}: {body}"));
+            assert_eq!(hits.len(), 1, "{body}");
+            assert_eq!(hits[0]["_index"], "audit-a");
+        }
+    }
+}
+
+#[tokio::test]
+async fn wildcard_authorization_sql_requires_read_on_the_parsed_table() {
+    let (app, _dir, admin, _, _) = wildcard_auth_fixture().await;
+    let (status, body) = send(
+        &app,
+        "PUT",
+        "/audit_a/_doc/1?refresh=true",
+        &admin,
+        r#"{"message":"original"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let reader = mint(&app, &admin, r#"{"name":"sql-reader","role_descriptors":{"r":{"indices":[{"names":["audit_a"],"privileges":["read"]}]}}}"#).await;
+    let writer = mint(&app, &admin, r#"{"name":"sql-writer","role_descriptors":{"r":{"indices":[{"names":["audit_a"],"privileges":["write"]}]}}}"#).await;
+    let query = r#"{"query":"SELECT * FROM audit_a"}"#;
+    let (status, body) = send(&app, "POST", "/_sql", &writer, query).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = send(&app, "POST", "/_sql", &reader, query).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"][0][0], "original", "{body}");
+}
+
+#[tokio::test]
+async fn wildcard_authorization_clone_targets_are_checked_before_creation() {
+    let (app, _dir, admin, _, _) = wildcard_auth_fixture().await;
+    let manager = mint(&app, &admin, r#"{"name":"manager","role_descriptors":{"r":{"indices":[{"names":["audit-a","copied-*"],"privileges":["manage"]}]}}}"#).await;
+    let limited = mint(&app, &admin, r#"{"name":"limited","role_descriptors":{"r":{"indices":[{"names":["audit-a"],"privileges":["manage"]}]}}}"#).await;
+    for op in ["_clone", "_shrink", "_split"] {
+        let target = format!("copied-{}", &op[1..]);
+        let uri = format!("/audit-a/{op}/{target}");
+        let (status, body) = send(&app, "POST", &uri, &limited, "{}").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+        let (status, body) = send(&app, "HEAD", &format!("/{target}"), &admin, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (status, body) = send(&app, "POST", &uri, &manager, "{}").await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let (status, body) = send(&app, "GET", &format!("/{target}/_doc/1"), &admin, "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["_source"]["message"], "original");
+    }
+}
+
+#[tokio::test]
+async fn wildcard_authorization_rollover_refusal_preserves_generation() {
+    let (state, dir) = auth_enabled_state();
+    state
+        .engine
+        .create_data_stream("audit-roll")
+        .expect("stream");
+    let app = build_es_compat_router(state.clone());
+    let admin = format!("ApiKey {ADMIN_KEY}");
+    let limited = mint(&app, &admin, r#"{"name":"limited","role_descriptors":{"r":{"indices":[{"names":[".ds-audit-roll-000001"],"privileges":["manage"]}]}}}"#).await;
+    let before = state.engine.data_streams.get("audit-roll").unwrap().clone();
+    let aliases_before = state.engine.aliases.get("audit-roll").unwrap().clone();
+    let persisted_before = std::fs::read(dir.path().join("cluster_state.json")).unwrap();
+    let (status, body) = send(&app, "POST", "/audit-roll/_rollover", &limited, "{}").await;
+    assert!(!status.is_success(), "{body}");
+    let after = state.engine.data_streams.get("audit-roll").unwrap().clone();
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.backing_indices, before.backing_indices);
+    assert_eq!(
+        *state.engine.aliases.get("audit-roll").unwrap(),
+        aliases_before
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("cluster_state.json")).unwrap(),
+        persisted_before
+    );
+    assert!(!state
+        .engine
+        .index_name_list()
+        .contains(&".ds-audit-roll-000002".to_string()));
+    let manager = mint(&app, &admin, r#"{"name":"manager","role_descriptors":{"r":{"indices":[{"names":[".ds-audit-roll-*"],"privileges":["manage"]}]}}}"#).await;
+    let (status, body) = send(&app, "POST", "/audit-roll/_rollover", &manager, "{}").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["new_index"], ".ds-audit-roll-000002");
+}
+
+#[tokio::test]
+async fn wildcard_authorization_date_math_matches_the_concrete_grant() {
+    let (state, _dir) = auth_enabled_state();
+    let app = build_es_compat_router(state);
+    let admin = format!("ApiKey {ADMIN_KEY}");
+    let expression = "<audit-{now/d}>";
+    let concrete = xerj_api::es_compat::resolve_date_math_index(expression);
+    let grant = serde_json::json!({"name":"date","role_descriptors":{"r":{"indices":[
+        {"names":[concrete],"privileges":["read","write","manage"]}
+    ]}}});
+    let key = mint(&app, &admin, &grant.to_string()).await;
+    let path = "/%3Caudit-%7Bnow%2Fd%7D%3E";
+    let (status, body) = send(&app, "PUT", path, &key, "{}").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &format!("/{concrete}/_doc/date"),
+        &key,
+        r#"{"message":"dated"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send(
+        &app,
+        "POST",
+        &format!("{path}/_search"),
+        &key,
+        r#"{"query":{"match_all":{}}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["hits"]["hits"][0]["_source"]["message"], "dated");
+}
+
+#[tokio::test]
+async fn wildcard_authorization_rollover_second_check_preserves_generation() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct RefuseSecond(AtomicUsize);
+    impl xerj_engine::index_guard::IndexVisibility for RefuseSecond {
+        fn visible(&self, _: &str) -> bool {
+            self.0.fetch_add(1, Ordering::SeqCst) == 0
+        }
+    }
+    let (state, dir) = auth_enabled_state();
+    state.engine.create_data_stream("audit-roll").unwrap();
+    let before = std::fs::read(dir.path().join("cluster_state.json")).unwrap();
+    let guard = Arc::new(RefuseSecond(AtomicUsize::new(0)));
+    let result = xerj_engine::index_guard::scoped(guard.clone(), async {
+        state.engine.rollover_data_stream("audit-roll")
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(guard.0.load(Ordering::SeqCst), 2);
+    let stream = state.engine.data_streams.get("audit-roll").unwrap();
+    assert_eq!(stream.generation, 1);
+    assert_eq!(stream.backing_indices, [".ds-audit-roll-000001"]);
+    assert_eq!(
+        std::fs::read(dir.path().join("cluster_state.json")).unwrap(),
+        before
+    );
+    assert!(!dir.path().join(".ds-audit-roll-000002").exists());
+}
+
+async fn by_query_requires_write_after_alias_resolution(op: &str) {
+    use std::{collections::HashSet, sync::Arc};
+    use xerj_api::auth::Principal;
+    use xerj_engine::rbac::{Privilege, Role};
+
+    let (state, _dir) = auth_enabled_state();
+    let setup = build_es_compat_router(state.clone());
+    let admin = format!("ApiKey {ADMIN_KEY}");
+    let (status, body) = send(
+        &setup,
+        "PUT",
+        "/readonly/_doc/1?refresh=true",
+        &admin,
+        r#"{"message":"original"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let key = mint(&setup, &admin, r#"{"name":"mixed","role_descriptors":{"r":{"indices":[{"names":["readonly"],"privileges":["read"]},{"names":["writable"],"privileges":["write"]}]}}}"#).await;
+    state.engine.add_alias("work", "readonly").unwrap();
+    let principal = Principal::Scoped {
+        key_id: "mixed".into(),
+        roles: vec![
+            Role::new(
+                "reader",
+                HashSet::from([Privilege::ReadIndex]),
+                vec!["readonly".into()],
+            ),
+            Role::new(
+                "writer",
+                HashSet::from([Privilege::WriteIndex]),
+                vec!["writable".into()],
+            ),
+        ],
+    };
+    // Model a completed preflight followed by alias retargeting: handlers must
+    // check the concrete mutation target even under an any-privilege guard.
+    let app = axum::Router::new()
+        .route(
+            "/:index/_delete_by_query",
+            axum::routing::post(xerj_api::es_compat::delete_by_query),
+        )
+        .route(
+            "/:index/_update_by_query",
+            axum::routing::post(xerj_api::es_compat::update_by_query),
+        )
+        .with_state(state);
+    let payload =
+        r#"{"query":{"match_all":{}},"script":{"source":"ctx._source.message = 'changed'"}}"#;
+    let guard: Arc<dyn xerj_engine::index_guard::IndexVisibility> =
+        xerj_api::authz::visibility_for(&principal);
+    let (status, body) = xerj_engine::index_guard::scoped(
+        guard,
+        send(&app, "POST", &format!("/work/{op}"), &key, payload),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = send(&setup, "GET", "/readonly/_doc/1", &admin, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["_source"]["message"], "original");
+}
+
+#[tokio::test]
+async fn wildcard_authorization_delete_by_query_rechecks_the_concrete_action() {
+    by_query_requires_write_after_alias_resolution("_delete_by_query").await;
+}
+
+#[tokio::test]
+async fn wildcard_authorization_update_by_query_rechecks_the_concrete_action() {
+    by_query_requires_write_after_alias_resolution("_update_by_query").await;
+}

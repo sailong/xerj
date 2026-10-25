@@ -4168,11 +4168,16 @@ impl Engine {
             .get_mut(name)
             .ok_or_else(|| EngineError::Common(xerj_common::XerjError::index_not_found(name)))?;
 
-        ds.generation += 1;
-        let new_backing = format!(".ds-{}-{:06}", name, ds.generation);
-        drop(ds); // release borrow before calling create_index
-
+        let new_backing = format!(".ds-{}-{:06}", name, ds.generation + 1);
+        // Refuse before changing the generation, while its lock pins the target.
+        if !crate::index_guard::visible(&new_backing) {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::index_not_found(&new_backing),
+            ));
+        }
         self.create_index(&new_backing, Schema::empty())?;
+        ds.generation += 1;
+        drop(ds);
         // Update alias to point at the new (write) backing index.
         // Keep old backing indices accessible for reads via the alias list.
         if let Some(mut entry) = self.aliases.get_mut(name) {

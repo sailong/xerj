@@ -31,7 +31,9 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
 
 use xerj_api::auth::Principal;
+use xerj_api::authz::{visibility_for, AliasResolver};
 use xerj_api::AppState;
+use xerj_engine::index_guard;
 use xerj_engine::rbac::Privilege;
 use xerj_query::parse_request;
 
@@ -57,6 +59,23 @@ impl GrpcService {
     pub fn new(state: AppState) -> Self {
         Self { state }
     }
+
+    fn get_write_index(
+        &self,
+        index: &str,
+    ) -> xerj_engine::Result<std::sync::Arc<xerj_engine::index::Index>> {
+        // Auto-create checks the alias literal and can turn a hidden/missing
+        // backing into a new index. Existing aliases must only resolve.
+        if self
+            .state
+            .targets(index)
+            .is_some_and(|backing| !backing.is_empty())
+        {
+            self.state.engine.get_index(index)
+        } else {
+            self.state.engine.get_or_create_index(index)
+        }
+    }
 }
 
 /// Authorize an RPC that names an index.
@@ -74,18 +93,45 @@ impl GrpcService {
 /// path and force an unwrap at every `?`.
 #[allow(clippy::result_large_err)]
 fn authorize(
+    state: &AppState,
     extensions: &tonic::Extensions,
     index: &str,
     privilege: Privilege,
 ) -> Result<(), Status> {
     let principal = extensions.get::<Principal>().unwrap_or(&Principal::Denied);
-    if principal.allows_index(index, privilege) {
-        Ok(())
-    } else {
-        Err(Status::permission_denied(format!(
-            "this credential is not authorized for [{index}]"
-        )))
+    let backing = state
+        .targets(index)
+        .filter(|targets| !targets.is_empty())
+        .unwrap_or_else(|| vec![index.to_string()]);
+    // Match HTTP authorization: every backing needs the operation's grant,
+    // even though Engine::get_index currently selects only the first target.
+    for target in backing {
+        if !principal.allows_index(&target, privilege) {
+            return Err(Status::permission_denied(format!(
+                "this credential is not authorized for [{target}]"
+            )));
+        }
     }
+    Ok(())
+}
+
+async fn scope_rpc<F: std::future::Future>(
+    extensions: &tonic::Extensions,
+    privilege: Privilege,
+    future: F,
+) -> F::Output {
+    let mut principal = extensions
+        .get::<Principal>()
+        .cloned()
+        .unwrap_or(Principal::Denied);
+    // Narrow HTTP's any-privilege visibility to this RPC's action, so alias
+    // retargeting cannot turn a merely readable backing into a writable one.
+    if let Principal::Scoped { roles, .. } = &mut principal {
+        for role in roles {
+            role.privileges.retain(|held| *held == privilege);
+        }
+    }
+    index_guard::scoped(visibility_for(&principal), future).await
 }
 
 /// Same rule as the HTTP middleware: a pattern that could reach the reserved
@@ -108,83 +154,86 @@ impl XerjSearch for GrpcService {
         request: Request<pb::SearchRequest>,
     ) -> Result<Response<pb::SearchResponse>, Status> {
         let (_meta, extensions, req) = request.into_parts();
-        let principal = extensions.get::<Principal>().unwrap_or(&Principal::Denied);
-        reject_wildcards(principal, &req.index)?;
-        // Before `get_index`, so 403-vs-not-found cannot map the node's brains.
-        authorize(&extensions, &req.index, Privilege::ReadIndex)?;
+        scope_rpc(&extensions, Privilege::ReadIndex, async {
+            let principal = extensions.get::<Principal>().unwrap_or(&Principal::Denied);
+            reject_wildcards(principal, &req.index)?;
+            // Before `get_index`, so 403-vs-not-found cannot map the node's brains.
+            authorize(&self.state, &extensions, &req.index, Privilege::ReadIndex)?;
 
-        let idx = self
-            .state
-            .engine
-            .get_index(&req.index)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            let idx = self
+                .state
+                .engine
+                .get_index(&req.index)
+                .map_err(|e| Status::not_found(e.to_string()))?;
 
-        // `query_json` is the ES query DSL. We accept both a bare query clause
-        // (e.g. `{"match":{...}}`) and a full request body (`{"query":{...},
-        // "size":...}`); an empty string means match_all. The dedicated
-        // `size`/`from` fields override the body when set (non-zero).
-        let mut body: serde_json::Value = if req.query_json.trim().is_empty() {
-            serde_json::json!({ "query": { "match_all": {} } })
-        } else {
-            serde_json::from_str(&req.query_json).map_err(|e| {
-                Status::invalid_argument(format!("query_json is not valid JSON: {e}"))
-            })?
-        };
-        // `query_json` may be a full request body, and `parse_request` ignores
-        // keys it does not know — so a `rerank` block vanished here and the
-        // caller got the engine's order back, believing it had been reranked.
-        // Refused by name instead. Checked before the bare-clause wrap below,
-        // which would otherwise bury the key inside `query`.
-        // `carries_rerank`, the rule every HTTP surface uses: `"rerank": null`
-        // is an absent block, not a rerank request. A `judge` block (issue
-        // #1060) is refused for the same reason, through the same
-        // second-stage check the raw-JSON HTTP surfaces use — naming the
-        // block the body actually carries.
-        if xerj_api::judge_stage::carries_second_stage(&body) {
-            let reason = if xerj_api::rerank_stage::carries_rerank(&body) {
-                xerj_api::rerank_stage::unsupported_reason("the gRPC Search RPC")
+            // `query_json` is the ES query DSL. We accept both a bare query clause
+            // (e.g. `{"match":{...}}`) and a full request body (`{"query":{...},
+            // "size":...}`); an empty string means match_all. The dedicated
+            // `size`/`from` fields override the body when set (non-zero).
+            let mut body: serde_json::Value = if req.query_json.trim().is_empty() {
+                serde_json::json!({ "query": { "match_all": {} } })
             } else {
-                xerj_api::judge_stage::unsupported_reason("the gRPC Search RPC")
+                serde_json::from_str(&req.query_json).map_err(|e| {
+                    Status::invalid_argument(format!("query_json is not valid JSON: {e}"))
+                })?
             };
-            return Err(Status::invalid_argument(reason));
-        }
-        if body.get("query").is_none() {
-            body = serde_json::json!({ "query": body });
-        }
-        if req.size != 0 {
-            body["size"] = serde_json::json!(req.size);
-        }
-        if req.from != 0 {
-            body["from"] = serde_json::json!(req.from);
-        }
+            // `query_json` may be a full request body, and `parse_request` ignores
+            // keys it does not know — so a `rerank` block vanished here and the
+            // caller got the engine's order back, believing it had been reranked.
+            // Refused by name instead. Checked before the bare-clause wrap below,
+            // which would otherwise bury the key inside `query`.
+            // `carries_rerank`, the rule every HTTP surface uses: `"rerank": null`
+            // is an absent block, not a rerank request. A `judge` block (issue
+            // #1060) is refused for the same reason, through the same
+            // second-stage check the raw-JSON HTTP surfaces use — naming the
+            // block the body actually carries.
+            if xerj_api::judge_stage::carries_second_stage(&body) {
+                let reason = if xerj_api::rerank_stage::carries_rerank(&body) {
+                    xerj_api::rerank_stage::unsupported_reason("the gRPC Search RPC")
+                } else {
+                    xerj_api::judge_stage::unsupported_reason("the gRPC Search RPC")
+                };
+                return Err(Status::invalid_argument(reason));
+            }
+            if body.get("query").is_none() {
+                body = serde_json::json!({ "query": body });
+            }
+            if req.size != 0 {
+                body["size"] = serde_json::json!(req.size);
+            }
+            if req.from != 0 {
+                body["from"] = serde_json::json!(req.from);
+            }
 
-        let search_req = parse_request(&body)
-            .map_err(|e| Status::invalid_argument(format!("invalid query: {e}")))?;
+            let search_req = parse_request(&body)
+                .map_err(|e| Status::invalid_argument(format!("invalid query: {e}")))?;
 
-        let started = std::time::Instant::now();
-        let result = idx
-            .search(&search_req)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        let took_ms = started.elapsed().as_millis() as i64;
+            let started = std::time::Instant::now();
+            let result = idx
+                .search(&search_req)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let took_ms = started.elapsed().as_millis() as i64;
 
-        let hits = result
-            .hits
-            .iter()
-            .map(|h| pb::Hit {
-                id: h.id.clone(),
-                score: h.score,
-                source_json: h.source.to_string(),
-                index: req.index.clone(),
-            })
-            .collect();
+            let hits = result
+                .hits
+                .iter()
+                .map(|h| pb::Hit {
+                    id: h.id.clone(),
+                    score: h.score,
+                    source_json: h.source.to_string(),
+                    index: req.index.clone(),
+                })
+                .collect();
 
-        Ok(Response::new(pb::SearchResponse {
-            total_hits: result.total.value as i64,
-            hits,
-            took_ms,
-            timed_out: result.timed_out,
-        }))
+            Ok(Response::new(pb::SearchResponse {
+                total_hits: result.total.value as i64,
+                hits,
+                took_ms,
+                timed_out: result.timed_out,
+            }))
+        })
+        .await
     }
 
     async fn index(
@@ -192,35 +241,38 @@ impl XerjSearch for GrpcService {
         request: Request<pb::IndexRequest>,
     ) -> Result<Response<pb::IndexResponse>, Status> {
         let (_meta, extensions, req) = request.into_parts();
-        authorize(&extensions, &req.index, Privilege::WriteIndex)?;
+        scope_rpc(&extensions, Privilege::WriteIndex, async {
+            authorize(&self.state, &extensions, &req.index, Privilege::WriteIndex)?;
 
-        // Index-on-write: ES auto-creates the index on first document.
-        let idx = self
-            .state
-            .engine
-            .get_or_create_index(&req.index)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            // Index-on-write: ES auto-creates the index on first document.
+            let idx = self
+                .get_write_index(&req.index)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
-        let source: serde_json::Value = serde_json::from_str(&req.source_json)
-            .map_err(|e| Status::invalid_argument(format!("source_json is not valid JSON: {e}")))?;
+            let source: serde_json::Value =
+                serde_json::from_str(&req.source_json).map_err(|e| {
+                    Status::invalid_argument(format!("source_json is not valid JSON: {e}"))
+                })?;
 
-        let id = if req.id.is_empty() {
-            None
-        } else {
-            Some(req.id.clone())
-        };
+            let id = if req.id.is_empty() {
+                None
+            } else {
+                Some(req.id.clone())
+            };
 
-        let resp = idx
-            .index_document(id, source)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        self.state.metrics.record_doc_indexed(&req.index);
+            let resp = idx
+                .index_document(id, source)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            self.state.metrics.record_doc_indexed(&req.index);
 
-        Ok(Response::new(pb::IndexResponse {
-            id: resp.id,
-            version: resp.version as i64,
-            result: resp.result,
-        }))
+            Ok(Response::new(pb::IndexResponse {
+                id: resp.id,
+                version: resp.version as i64,
+                result: resp.result,
+            }))
+        })
+        .await
     }
 
     async fn bulk_index(
@@ -228,51 +280,55 @@ impl XerjSearch for GrpcService {
         request: Request<Streaming<pb::IndexRequest>>,
     ) -> Result<Response<pb::BulkResponse>, Status> {
         let (_meta, extensions, mut stream) = request.into_parts();
-        let started = std::time::Instant::now();
-        let mut indexed = 0i32;
-        let mut errors = false;
+        scope_rpc(&extensions, Privilege::WriteIndex, async {
+            let started = std::time::Instant::now();
+            let mut indexed = 0i32;
+            let mut errors = false;
 
-        while let Some(item) = stream.message().await? {
-            // Per message: one stream may name many indices, and an
-            // unauthorized one must not ride in on an authorized one. A refused
-            // item is counted as an error, matching how this loop already
-            // reports a bad index or an unparsable source.
-            if authorize(&extensions, &item.index, Privilege::WriteIndex).is_err() {
-                errors = true;
-                continue;
-            }
-            let idx = match self.state.engine.get_or_create_index(&item.index) {
-                Ok(i) => i,
-                Err(_) => {
+            while let Some(item) = stream.message().await? {
+                // Per message: one stream may name many indices, and an
+                // unauthorized one must not ride in on an authorized one. A refused
+                // item is counted as an error, matching how this loop already
+                // reports a bad index or an unparsable source.
+                if authorize(&self.state, &extensions, &item.index, Privilege::WriteIndex).is_err()
+                {
                     errors = true;
                     continue;
                 }
-            };
-            let source: serde_json::Value = match serde_json::from_str(&item.source_json) {
-                Ok(v) => v,
-                Err(_) => {
+                let idx = match self.get_write_index(&item.index) {
+                    Ok(i) => i,
+                    Err(_) => {
+                        errors = true;
+                        continue;
+                    }
+                };
+                let source: serde_json::Value = match serde_json::from_str(&item.source_json) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        errors = true;
+                        continue;
+                    }
+                };
+                let id = if item.id.is_empty() {
+                    None
+                } else {
+                    Some(item.id)
+                };
+                if idx.index_document(id, source).await.is_ok() {
+                    indexed += 1;
+                    self.state.metrics.record_doc_indexed(&item.index);
+                } else {
                     errors = true;
-                    continue;
                 }
-            };
-            let id = if item.id.is_empty() {
-                None
-            } else {
-                Some(item.id)
-            };
-            if idx.index_document(id, source).await.is_ok() {
-                indexed += 1;
-                self.state.metrics.record_doc_indexed(&item.index);
-            } else {
-                errors = true;
             }
-        }
 
-        Ok(Response::new(pb::BulkResponse {
-            took_ms: started.elapsed().as_millis() as i64,
-            errors,
-            indexed,
-        }))
+            Ok(Response::new(pb::BulkResponse {
+                took_ms: started.elapsed().as_millis() as i64,
+                errors,
+                indexed,
+            }))
+        })
+        .await
     }
 
     async fn get_document(
@@ -280,42 +336,45 @@ impl XerjSearch for GrpcService {
         request: Request<pb::GetRequest>,
     ) -> Result<Response<pb::GetResponse>, Status> {
         let (_meta, extensions, req) = request.into_parts();
-        // Deliberately a hard denial rather than this RPC's soft "not found":
-        // answering `found: false` for an unauthorized index would still let a
-        // caller probe which indices exist by timing or by error shape.
-        authorize(&extensions, &req.index, Privilege::ReadIndex)?;
+        scope_rpc(&extensions, Privilege::ReadIndex, async {
+            // Deliberately a hard denial rather than this RPC's soft "not found":
+            // answering `found: false` for an unauthorized index would still let a
+            // caller probe which indices exist by timing or by error shape.
+            authorize(&self.state, &extensions, &req.index, Privilege::ReadIndex)?;
 
-        // Unknown index → "not found" (ES GET semantics), not an error.
-        let idx = match self.state.engine.get_index(&req.index) {
-            Ok(i) => i,
-            Err(_) => {
-                return Ok(Response::new(pb::GetResponse {
+            // Unknown index → "not found" (ES GET semantics), not an error.
+            let idx = match self.state.engine.get_index(&req.index) {
+                Ok(i) => i,
+                Err(_) => {
+                    return Ok(Response::new(pb::GetResponse {
+                        found: false,
+                        id: req.id,
+                        source_json: String::new(),
+                        version: 0,
+                    }));
+                }
+            };
+
+            match idx
+                .get_document(&req.id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+            {
+                Some(source) => Ok(Response::new(pb::GetResponse {
+                    found: true,
+                    id: req.id,
+                    source_json: source.to_string(),
+                    version: 1,
+                })),
+                None => Ok(Response::new(pb::GetResponse {
                     found: false,
                     id: req.id,
                     source_json: String::new(),
                     version: 0,
-                }));
+                })),
             }
-        };
-
-        match idx
-            .get_document(&req.id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-        {
-            Some(source) => Ok(Response::new(pb::GetResponse {
-                found: true,
-                id: req.id,
-                source_json: source.to_string(),
-                version: 1,
-            })),
-            None => Ok(Response::new(pb::GetResponse {
-                found: false,
-                id: req.id,
-                source_json: String::new(),
-                version: 0,
-            })),
-        }
+        })
+        .await
     }
 
     async fn delete_document(
@@ -323,22 +382,25 @@ impl XerjSearch for GrpcService {
         request: Request<pb::DeleteRequest>,
     ) -> Result<Response<pb::DeleteResponse>, Status> {
         let (_meta, extensions, req) = request.into_parts();
-        authorize(&extensions, &req.index, Privilege::WriteIndex)?;
+        scope_rpc(&extensions, Privilege::WriteIndex, async {
+            authorize(&self.state, &extensions, &req.index, Privilege::WriteIndex)?;
 
-        let idx = self
-            .state
-            .engine
-            .get_index(&req.index)
-            .map_err(|e| Status::not_found(e.to_string()))?;
+            let idx = self
+                .state
+                .engine
+                .get_index(&req.index)
+                .map_err(|e| Status::not_found(e.to_string()))?;
 
-        let existed = idx
-            .delete_document(&req.id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            let existed = idx
+                .delete_document(&req.id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(pb::DeleteResponse {
-            result: if existed { "deleted" } else { "not_found" }.to_string(),
-        }))
+            Ok(Response::new(pb::DeleteResponse {
+                result: if existed { "deleted" } else { "not_found" }.to_string(),
+            }))
+        })
+        .await
     }
 
     async fn health(
@@ -998,6 +1060,445 @@ mod tests {
             )
             .unwrap();
         format!("ApiKey {}", b64(&format!("{id}:s3cret")))
+    }
+
+    fn grpc_alias_request<T>(message: T, principal: &Principal) -> Request<T> {
+        let mut request = Request::new(message);
+        request.extensions_mut().insert(principal.clone());
+        request
+    }
+
+    fn grpc_alias_role(privileges: &[Privilege], indices: &[&str]) -> xerj_engine::rbac::Role {
+        xerj_engine::rbac::Role::new(
+            "grpc-alias-test",
+            privileges.iter().copied().collect(),
+            indices.iter().map(|s| (*s).to_string()).collect(),
+        )
+    }
+
+    async fn grpc_alias_fixture(dir: &TempDir) -> AppState {
+        let state = app_state_with_auth(dir, "grpc-alias-admin");
+        for index in ["public", "public-second", ".xerj-memory-private"] {
+            state
+                .engine
+                .get_or_create_index(index)
+                .unwrap()
+                .index_document(Some("seed".into()), serde_json::json!({"body": index}))
+                .await
+                .unwrap();
+        }
+        for (alias, backing) in [
+            ("public-alias", "public"),
+            ("private-alias", ".xerj-memory-private"),
+            ("mixed-alias", "public"),
+            ("mixed-alias", ".xerj-memory-private"),
+            ("public-multi", "public"),
+            ("public-multi", "public-second"),
+        ] {
+            state.engine.add_alias(alias, backing).unwrap();
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn grpc_alias_authorization_get_private() {
+        let dir = TempDir::new().unwrap();
+        let svc = GrpcService::new(grpc_alias_fixture(&dir).await);
+        let legacy = Principal::Unscoped {
+            key_id: "legacy".into(),
+        };
+        let denied = svc
+            .get_document(grpc_alias_request(
+                pb::GetRequest {
+                    index: "private-alias".into(),
+                    id: "seed".into(),
+                },
+                &legacy,
+            ))
+            .await
+            .expect_err("ordinary alias must not expose a private memory document");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn grpc_alias_authorization_search_checks_every_backing() {
+        let dir = TempDir::new().unwrap();
+        let svc = GrpcService::new(grpc_alias_fixture(&dir).await);
+        let legacy = Principal::Unscoped {
+            key_id: "legacy".into(),
+        };
+        // The first target is public: checking only the one Engine returns is insufficient.
+        for index in ["mixed-alias", "private-alias"] {
+            let denied = svc
+                .search(grpc_alias_request(
+                    pb::SearchRequest {
+                        index: index.into(),
+                        query_json: String::new(),
+                        size: 10,
+                        from: 0,
+                    },
+                    &legacy,
+                ))
+                .await
+                .expect_err("every alias backing must carry the requested read grant");
+            assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_alias_authorization_index_cannot_write_private() {
+        let dir = TempDir::new().unwrap();
+        let state = grpc_alias_fixture(&dir).await;
+        let svc = GrpcService::new(state.clone());
+        let legacy = Principal::Unscoped {
+            key_id: "legacy".into(),
+        };
+        for index in ["private-alias", "mixed-alias"] {
+            let denied = svc
+                .index(grpc_alias_request(
+                    pb::IndexRequest {
+                        index: index.into(),
+                        id: "forged".into(),
+                        source_json: "{}".into(),
+                    },
+                    &legacy,
+                ))
+                .await
+                .expect_err("alias must not permit a write to unauthorized backing");
+            assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        }
+        for index in ["public", ".xerj-memory-private"] {
+            assert!(state
+                .engine
+                .get_index(index)
+                .unwrap()
+                .get_document("forged")
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_alias_authorization_delete_cannot_mutate_private() {
+        let dir = TempDir::new().unwrap();
+        let state = grpc_alias_fixture(&dir).await;
+        let svc = GrpcService::new(state.clone());
+        let legacy = Principal::Unscoped {
+            key_id: "legacy".into(),
+        };
+        for index in ["private-alias", "mixed-alias"] {
+            let denied = svc
+                .delete_document(grpc_alias_request(
+                    pb::DeleteRequest {
+                        index: index.into(),
+                        id: "seed".into(),
+                    },
+                    &legacy,
+                ))
+                .await
+                .expect_err("alias must not permit deletion from unauthorized backing");
+            assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        }
+        for index in ["public", ".xerj-memory-private"] {
+            assert!(state
+                .engine
+                .get_index(index)
+                .unwrap()
+                .get_document("seed")
+                .await
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_alias_authorization_backing_scopes_keep_normal_aliases() {
+        let dir = TempDir::new().unwrap();
+        let state = grpc_alias_fixture(&dir).await;
+        let svc = GrpcService::new(state.clone());
+        for index in ["public-alias", "public-multi", "private-alias"] {
+            // No grant on the alias literal, matching HTTP's backing-index contract.
+            let backing = state.engine.resolve_alias(index);
+            let principal = Principal::Scoped {
+                key_id: "backing-only".into(),
+                roles: vec![grpc_alias_role(
+                    &[Privilege::ReadIndex, Privilege::WriteIndex],
+                    &backing.iter().map(String::as_str).collect::<Vec<_>>(),
+                )],
+            };
+            svc.index(grpc_alias_request(
+                pb::IndexRequest {
+                    index: index.into(),
+                    id: "allowed".into(),
+                    source_json: "{}".into(),
+                },
+                &principal,
+            ))
+            .await
+            .expect("backing-scoped write through a normal alias");
+            assert!(
+                svc.get_document(grpc_alias_request(
+                    pb::GetRequest {
+                        index: index.into(),
+                        id: "allowed".into()
+                    },
+                    &principal,
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .found
+            );
+            assert!(
+                svc.search(grpc_alias_request(
+                    pb::SearchRequest {
+                        index: index.into(),
+                        query_json: String::new(),
+                        size: 10,
+                        from: 0
+                    },
+                    &principal,
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .total_hits
+                    >= 1
+            );
+            assert_eq!(
+                svc.delete_document(grpc_alias_request(
+                    pb::DeleteRequest {
+                        index: index.into(),
+                        id: "allowed".into()
+                    },
+                    &principal,
+                ))
+                .await
+                .unwrap()
+                .into_inner()
+                .result,
+                "deleted"
+            );
+        }
+        assert!(state
+            .engine
+            .get_index("public-second")
+            .unwrap()
+            .get_document("allowed")
+            .await
+            .unwrap()
+            .is_none());
+
+        // A grant on the public-looking alias alone must not grant its backing.
+        let alias_only = Principal::Scoped {
+            key_id: "alias-only".into(),
+            roles: vec![grpc_alias_role(&[Privilege::ReadIndex], &["private-alias"])],
+        };
+        assert_eq!(
+            svc.get_document(grpc_alias_request(
+                pb::GetRequest {
+                    index: "private-alias".into(),
+                    id: "seed".into()
+                },
+                &alias_only,
+            ))
+            .await
+            .unwrap_err()
+            .code(),
+            tonic::Code::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_alias_authorization_guard_blocks_retarget_and_restores_scope() {
+        let dir = TempDir::new().unwrap();
+        let state = grpc_alias_fixture(&dir).await;
+        let svc = GrpcService::new(state.clone());
+        let principal = Principal::Scoped {
+            key_id: "mixed-grants".into(),
+            roles: vec![
+                grpc_alias_role(&[Privilege::WriteIndex], &["public"]),
+                grpc_alias_role(&[Privilege::ReadIndex], &["public-second"]),
+            ],
+        };
+        let request = grpc_alias_request((), &principal);
+        assert!(!index_guard::guarded());
+        scope_rpc(request.extensions(), Privilege::WriteIndex, async {
+            assert!(index_guard::guarded(), "RPC execution must install a guard");
+            assert!(index_guard::visible("public"));
+            assert!(!index_guard::visible("public-second"), "read is not write");
+            assert!(!index_guard::visible(".xerj-memory-private"));
+            authorize(
+                &state,
+                request.extensions(),
+                "public-alias",
+                Privilege::WriteIndex,
+            )
+            .unwrap();
+            // Retarget after the front-line decision, before Engine resolves.
+            state.engine.remove_alias("public-alias", "public").unwrap();
+            state
+                .engine
+                .add_alias("public-alias", "public-second")
+                .unwrap();
+            tokio::task::yield_now().await;
+            assert!(
+                svc.get_write_index("public-alias").is_err(),
+                "a retargeted alias must not bypass the operation's guard"
+            );
+            assert!(state.engine.get_or_create_index("not-granted").is_err());
+            assert!(index_guard::guarded(), "guard must survive an await");
+        })
+        .await;
+        scope_rpc(request.extensions(), Privilege::ReadIndex, async {
+            assert!(!index_guard::visible("public"), "write is not read");
+            assert!(index_guard::visible("public-second"));
+            assert!(state.engine.get_index("public-alias").is_ok());
+        })
+        .await;
+        assert!(!index_guard::guarded(), "guard must end with the RPC");
+        assert!(state.engine.get_index("not-granted").is_err());
+        for index in ["public", "public-second"] {
+            assert!(state
+                .engine
+                .get_index(index)
+                .unwrap()
+                .get_document("seed")
+                .await
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_alias_authorization_bulk_checks_each_message_and_privilege() {
+        let dir = TempDir::new().unwrap();
+        let state = grpc_alias_fixture(&dir).await;
+        let legacy: tonic::metadata::MetadataValue<_> =
+            mint_key(&state, "legacy", Vec::new()).parse().unwrap();
+        let writer: tonic::metadata::MetadataValue<_> = mint_key(
+            &state,
+            "writer",
+            vec![grpc_alias_role(
+                &[Privilege::WriteIndex],
+                &["public", "public-second"],
+            )],
+        )
+        .parse()
+        .unwrap();
+        let reader: tonic::metadata::MetadataValue<_> = mint_key(
+            &state,
+            "reader",
+            vec![grpc_alias_role(
+                &[Privilege::ReadIndex],
+                &["public", "public-alias"],
+            )],
+        )
+        .parse()
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hub = xerj_api::hub_api::HubShared::new(state.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_grpc_on(listener, state.clone(), hub, async {
+            let _ = rx.await;
+        }));
+        let mut client = connect(&url).await;
+        for (credential, id, expected) in [
+            (&legacy, "legacy-bulk", 2),
+            (&writer, "writer-bulk", 2),
+            (&reader, "reader-bulk", 0),
+        ] {
+            let messages = [
+                "public-alias",
+                "private-alias",
+                "mixed-alias",
+                "public-multi",
+            ]
+            .map(|index| pb::IndexRequest {
+                index: index.into(),
+                id: id.into(),
+                source_json: "{}".into(),
+            });
+            let result = client
+                .bulk_index(with_authorization(tokio_stream::iter(messages), credential))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                result.indexed, expected,
+                "per-message backing authorization: {id}"
+            );
+            assert!(result.errors, "denied messages must be reported");
+            assert!(state
+                .engine
+                .get_index(".xerj-memory-private")
+                .unwrap()
+                .get_document(id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+        // The read-only key cannot write; the write-only key cannot read.
+        let denied = client
+            .index(with_authorization(
+                pb::IndexRequest {
+                    index: "public-alias".into(),
+                    id: "reader-write".into(),
+                    source_json: "{}".into(),
+                },
+                &reader,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        let denied = client
+            .get_document(with_authorization(
+                pb::GetRequest {
+                    index: "public-alias".into(),
+                    id: "seed".into(),
+                },
+                &writer,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        let denied = client
+            .search(with_authorization(
+                pb::SearchRequest {
+                    index: "public-alias".into(),
+                    query_json: String::new(),
+                    size: 10,
+                    from: 0,
+                },
+                &writer,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        let denied = client
+            .delete_document(with_authorization(
+                pb::DeleteRequest {
+                    index: "public-alias".into(),
+                    id: "seed".into(),
+                },
+                &reader,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+        assert!(state
+            .engine
+            .get_index("public")
+            .unwrap()
+            .get_document("seed")
+            .await
+            .unwrap()
+            .is_some());
+        let _ = tx.send(());
+        server.await.unwrap().unwrap();
     }
 
     /// Issue #79 on the gRPC listener. Per-brain authorization has to hold on

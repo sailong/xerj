@@ -29167,6 +29167,18 @@ mod flat_object_field_caps_tests {
 // POST /_msearch — Multi-Search API (NDJSON)
 // ─────────────────────────────────────────────────────────────────────────────
 
+pub(crate) fn msearch_index_expression<'a>(
+    header: &'a Value,
+    default_index: Option<&'a str>,
+) -> &'a str {
+    header
+        .get("index")
+        .and_then(Value::as_str)
+        .filter(|s| s.split(',').any(|part| !part.trim().is_empty()))
+        .or(default_index)
+        .unwrap_or("*")
+}
+
 pub async fn msearch(State(state): State<AppState>, body: bytes::Bytes) -> impl IntoResponse {
     msearch_impl(state, body, None).await
 }
@@ -29296,12 +29308,7 @@ async fn msearch_impl(
 
         // Determine index name: header wins, then the path index (for
         // /{index}/_msearch), then "*" (all indices).
-        let index_name = header
-            .get("index")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| default_index.clone())
-            .unwrap_or_else(|| "*".to_string());
+        let index_name = msearch_index_expression(&header, default_index.as_deref()).to_string();
 
         let started = Instant::now();
 
@@ -30808,7 +30815,7 @@ fn es_aggregator_class_name_ctx(
 /// This used to handle one leading or one trailing `*` and fall back to
 /// string equality for anything else, so `logs-*-2026` (#1933) and
 /// `*-app-*` matched nothing and `_search` answered 0 hits with no error.
-fn glob_match_simple(pattern: &str, name: &str) -> bool {
+pub(crate) fn glob_match_simple(pattern: &str, name: &str) -> bool {
     if !pattern.contains('*') {
         return pattern == name;
     }
@@ -31457,12 +31464,10 @@ pub struct DeleteByQueryBody {
 /// index (the #524 hazard).
 async fn resolve_by_query_targets(
     state: &AppState,
+    principal: &crate::auth::Principal,
     spec: &str,
     user_query: Value,
-) -> std::result::Result<
-    (Vec<std::sync::Arc<xerj_engine::Index>>, Vec<String>, Value),
-    xerj_common::XerjError,
-> {
+) -> std::result::Result<(Vec<std::sync::Arc<xerj_engine::Index>>, Vec<String>, Value), Response> {
     let member_names = resolve_index_selector(state, spec).await;
 
     // Alias filters are keyed on the name AS WRITTEN (the alias, not its
@@ -31487,11 +31492,14 @@ async fn resolve_by_query_targets(
 
     let mut indices = Vec::with_capacity(member_names.len());
     for name in &member_names {
+        // Alias expansion is no longer pinned here; read dependencies cannot
+        // supply the write permission of a concrete mutation target.
+        crate::authz::authorize_index(principal, name, xerj_engine::rbac::Privilege::WriteIndex)?;
         indices.push(
             state
                 .engine
                 .get_index(name)
-                .map_err(xerj_common::XerjError::from)?,
+                .map_err(|e| ApiError::new(xerj_common::XerjError::from(e)).into_response())?,
         );
     }
     Ok((indices, member_names, effective_query))
@@ -31635,14 +31643,15 @@ pub async fn delete_by_query(
     State(state): State<AppState>,
     Path(index): Path<String>,
     Query(params): Query<HashMap<String, String>>,
+    principal: crate::auth::Principal,
     Json(body): Json<DeleteByQueryBody>,
 ) -> impl IntoResponse {
     // Fan the selector out to every member of a multi-index alias (#450), with
     // any alias filter already ANDed into the query.
     let (indices, index_names, effective_query) =
-        match resolve_by_query_targets(&state, &index, body.query.clone()).await {
+        match resolve_by_query_targets(&state, &principal, &index, body.query.clone()).await {
             Ok(t) => t,
-            Err(e) => return ApiError::new(e).into_response(),
+            Err(e) => return e,
         };
 
     // Validate the (alias-filter-ANDed) query once, up front, so a malformed
@@ -32271,15 +32280,16 @@ pub async fn update_by_query(
     State(state): State<AppState>,
     Path(index): Path<String>,
     Query(params): Query<HashMap<String, String>>,
+    principal: crate::auth::Principal,
     Json(body): Json<UpdateByQueryBody>,
 ) -> impl IntoResponse {
     let query_val = body.query.clone().unwrap_or(json!({ "match_all": {} }));
     // Fan the selector out to every member of a multi-index alias (#450), with
     // any alias filter already ANDed into the query.
     let (indices, index_names, effective_query) =
-        match resolve_by_query_targets(&state, &index, query_val).await {
+        match resolve_by_query_targets(&state, &principal, &index, query_val).await {
             Ok(t) => t,
-            Err(e) => return ApiError::new(e).into_response(),
+            Err(e) => return e,
         };
 
     // Validate the (alias-filter-ANDed) query once, up front, so a malformed
@@ -40257,12 +40267,7 @@ async fn msearch_template_impl(
 
         // Header wins, then the path index (for /{index}/_msearch/template),
         // then "*" (all indices).
-        let index_name = header
-            .get("index")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| default_index.clone())
-            .unwrap_or_else(|| "*".to_string());
+        let index_name = msearch_index_expression(&header, default_index.as_deref()).to_string();
 
         let params = tmpl_body.params.unwrap_or_default();
         let mut search_body_val: Value = if let Some(source_val) = tmpl_body.source {
