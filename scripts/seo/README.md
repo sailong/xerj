@@ -58,6 +58,7 @@ scripts/seo/urlmap.py       ─┘                      └─> a spliced block 
 
 landing/**/*.html  ── fix_heads.py ──> the <!-- seo:begin --> … <!-- seo:end --> block in every <head>, and the GA4 snippet at the top of <head>
 landing/**/*.html  ── fix_links.py ──> every internal <a href>, plus the site-map footer block
+landing/**/*.html  ── set_nav.py ───> the primary nav in every page
 landing/**/*.html  ── gen_sitemap.py ─> landing/sitemap.xml
 (brand tokens)     ── mk_og_card.py ──> landing/og/xerj-card.png
 ```
@@ -76,6 +77,7 @@ landing/**/*.html  ── gen_sitemap.py ─> landing/sitemap.xml
 | every internal `<a href>` in `landing/` | `fix_links.py` | write the href you mean; the pass rewrites it to the served form |
 | `landing/sitemap.xml` | `gen_sitemap.py` | it is derived from the filesystem and from git |
 | `landing/og/xerj-card.png` | `mk_og_card.py` | edit the rasteriser; the brand tokens come from `landing/style.css` |
+| the primary nav (`<nav class="nav">`) in every page, and in the `build_articles.py` templates | `set_nav.py` | edit `LEFT` / `RIGHT` in `set_nav.py`, then run it; `--check` verifies |
 | the `<a class="nav-stars">` GitHub stars badge in every primary nav (its fallback count) | `stars_badge.py` | run it to refresh the count from the GitHub API; `--check` verifies; `landing/theme.js` refreshes the number in the browser |
 
 Generated article pages and twins carry a first-line marker:
@@ -611,6 +613,32 @@ authoring aid; `--self-test` still passes and should stay passing.
 touch `claims_rules.py` or `scripts/seo/testdata/`.
 
 ### The check that must NOT be a gate
+
+`verify_agent_discovery.py` checks the agent-discovery contract after deployment:
+
+```sh
+python3 scripts/seo/verify_agent_discovery.py
+python3 scripts/seo/verify_agent_discovery.py https://staging.example.com --json
+# Opt in only on a deployment expected to publish the public xerj skill:
+python3 scripts/seo/verify_agent_discovery.py --skills --json
+```
+
+The default checks five requests: homepage GET and HEAD, then the three fixed
+documentation targets from its discovery headers. It requires the relations
+on the final response, not just in 103 Early Hints; a target must return 200
+with the expected media type, and OpenAPI JSON must have a version and paths.
+`--skills` additionally checks the v0.2.0 index, the public `xerj` entry, CORS,
+and the exact-byte SHA-256 of its single-file artifact. It checks consistency,
+not authenticity, and does not validate other skills or activate instructions.
+
+Only fixed paths on the chosen origin are fetched. Redirects are reported,
+never followed; responses are capped at 1 MiB. Requests are direct HTTP(S),
+without proxy configuration, credentials or cookies. `--timeout` limits each
+socket operation (not total run time). Exit 0 means pass, 1 means a delivery
+or contract failure, and 2 means invalid CLI arguments. Wait for deployment
+propagation before treating a failure as a code defect. The tool reads no
+XERJ node or user corpus and changes no remote state. CI runs only its
+loopback fixtures: `python3 scripts/seo/test_verify_agent_discovery.py`.
 
 `verify_live.py` needs a deployment, so on a pull request every URL it asks for
 404s. Wiring it into `seo.yml` would make the merge gate fail on correct work,

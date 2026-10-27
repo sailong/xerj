@@ -8676,6 +8676,12 @@ fn value_bearing_field_names(body: &EsSearchBody, fields: &[String]) -> Vec<Stri
         _ => names.extend(fields.iter().cloned()),
     }
     push_names(body.docvalue_fields.as_ref(), &mut names);
+    // `_passage` is computed by the engine into `hit.passage`, never read
+    // out of `_source`, so it cannot be dropped by a source filter. Counting
+    // it made every `fields: ["_passage"]` request with `_source` includes
+    // (the `xerj search` body) re-ask the engine for the whole document
+    // (#2422/#2423).
+    names.retain(|name| name != xerj_query::executor::PASSAGE_RESPONSE_FIELD);
     names
 }
 
@@ -10404,6 +10410,22 @@ fn referenced_or_recurse(v: &Value, out: &mut Vec<(String, String)>) {
 /// reasonable guess — and got a silent zero, because this corpus classifies
 /// Markdown as `txt-prose`/`txt-lines`. Discovering that cost the agent two
 /// round trips and a terms aggregation it had to think to write.
+/// Whether a response qualifies for the zero-hit `unknown_value` sample
+/// (#2451). Only a request that asked for hits (`size > 0`) and whose whole
+/// match set is empty: an empty page with a non-zero tracked total is a page
+/// past the end, not a wrong value, and a `size: 0` count/existence probe must
+/// stay as cheap as its own query — the sample is a 256-row full-source read.
+/// With `track_total_hits: false` the total is not authoritative, so the
+/// empty page (with `size > 0`) is the only signal, as before.
+fn zero_hit_value_sample_applies(
+    size: usize,
+    page_empty: bool,
+    total_count: u64,
+    track_total_disabled: bool,
+) -> bool {
+    size > 0 && page_empty && (track_total_disabled || total_count == 0)
+}
+
 fn unknown_value_hint(index: &str, field: &str, value: &str, present: &[String]) -> Value {
     json!({
         "hints": [{
@@ -11061,6 +11083,69 @@ mod search_response_hint_tests {
         let text = String::from_utf8(bytes.to_vec()).expect("utf8 response body");
         let json: Value = serde_json::from_str(&text).expect("valid JSON response body");
         (json, text)
+    }
+
+    fn has_unknown_value_hint(json: &Value) -> bool {
+        json["_xerj"]["hints"].as_array().is_some_and(|hints| {
+            hints
+                .iter()
+                .any(|h| h["code"].as_str() == Some("unknown_value"))
+        })
+    }
+
+    #[test]
+    fn zero_hit_value_sample_gates_on_the_match_set_not_the_page() {
+        // #2451: a `size: 0` probe never samples, hit or miss.
+        assert!(!super::zero_hit_value_sample_applies(0, true, 0, false));
+        assert!(!super::zero_hit_value_sample_applies(0, true, 7, false));
+        assert!(!super::zero_hit_value_sample_applies(0, true, 0, true));
+        // A page past the end of a non-empty match set is not a wrong value.
+        assert!(!super::zero_hit_value_sample_applies(10, true, 7, false));
+        // The case the hint exists for, tracked total or not.
+        assert!(super::zero_hit_value_sample_applies(10, true, 0, false));
+        assert!(super::zero_hit_value_sample_applies(10, true, 0, true));
+        assert!(!super::zero_hit_value_sample_applies(10, false, 3, false));
+    }
+
+    #[tokio::test]
+    async fn size_zero_term_probe_skips_the_unknown_value_sample() {
+        let state = test_state();
+        let mut schema = Schema::empty();
+        schema
+            .fields
+            .push(FieldConfig::new("kind", FieldType::Keyword));
+        state.engine.create_index("hint-probe", schema).unwrap();
+        let idx = state.engine.get_index("hint-probe").unwrap();
+        for (id, kind) in [("1", "alpha"), ("2", "beta")] {
+            idx.index_document(Some(id.into()), json!({ "kind": kind }))
+                .await
+                .unwrap();
+        }
+        idx.refresh().await.unwrap();
+        let router = crate::router::build_es_compat_router(state);
+
+        // A search that asked for hits and matched nothing keeps the hint.
+        let (json, _) = run_search(
+            &router,
+            "hint-probe",
+            json!({"size": 10, "query": {"term": {"kind": "gamma"}}}),
+        )
+        .await;
+        assert!(has_unknown_value_hint(&json), "hint expected: {json}");
+
+        // The autoindex existence-probe shape, miss and hit: an exact total,
+        // no sample (#2451).
+        for (value, total) in [("gamma", 0), ("alpha", 1)] {
+            let (json, _) = run_search(
+                &router,
+                "hint-probe",
+                json!({"size": 0, "track_total_hits": true,
+                       "query": {"term": {"kind": value}}}),
+            )
+            .await;
+            assert_eq!(json["hits"]["total"]["value"], total, "{json}");
+            assert!(!has_unknown_value_hint(&json), "no hint for size 0: {json}");
+        }
     }
 
     #[tokio::test]
@@ -13094,12 +13179,239 @@ async fn search_dispatch(
     principal: crate::auth::Principal,
     body: EsSearchJson,
 ) -> Response {
+    // #2400: `post_filter` narrows the hits, never the aggregations.
+    if let Some(split) = split_post_filter(&params, &body) {
+        return search_with_post_filter(state, index, params, principal, split).await;
+    }
+    search_routed(state, index, params, principal, body).await
+}
+
+/// One search through the cluster fan-out when it applies, else on this node.
+async fn search_routed(
+    state: AppState,
+    index: String,
+    params: EsSearchQueryParams,
+    principal: crate::auth::Principal,
+    body: EsSearchJson,
+) -> Response {
     if let Some(response) =
         crate::cluster_shard::fanout_search(&state, &index, &params, &principal, &body).await
     {
         return response;
     }
     search_impl(state, index, params, principal, body).await
+}
+
+/// The searches a request with `post_filter` becomes (#2400). Elasticsearch
+/// applies `post_filter` to the hits after the aggregations are computed, so
+/// a faceted UI can show a facet's other values while one is selected.
+///
+/// - `hits`: the query wrapped as `bool{must: [query], filter: [post_filter]}`,
+///   without aggregations. A filter clause does not score, so the hits, their
+///   scores and `hits.total` are what Elasticsearch returns.
+/// - `aggs`: when the request aggregates, the original request without
+///   `post_filter` and with `size: 0`, so the aggregations are exactly what
+///   they were before.
+struct PostFilterSplit {
+    hits: EsSearchBody,
+    aggs: Option<(EsSearchQueryParams, EsSearchBody)>,
+}
+
+/// `None` leaves the request as it is: no `post_filter`; a hybrid query, which
+/// `build_search_request` rejects beside `post_filter` (#943); or a `?q=`
+/// query, which replaces the body query this wraps.
+fn split_post_filter(params: &EsSearchQueryParams, body: &EsSearchJson) -> Option<PostFilterSplit> {
+    let original = body.0.as_ref()?;
+    let filter = original.post_filter.clone()?;
+    if params.q.is_some() {
+        return None;
+    }
+    let query = original
+        .query
+        .clone()
+        .unwrap_or_else(|| json!({ "match_all": {} }));
+    let hybrid = parse_request(&json!({ "query": query }))
+        .map(|req| req.query.contains_hybrid())
+        .unwrap_or(false);
+    if hybrid {
+        return None;
+    }
+
+    let mut hits = original.clone();
+    hits.post_filter = None;
+    hits.query = Some(json!({ "bool": { "must": [query], "filter": [filter] } }));
+    let had_aggs = hits.aggs.take().is_some();
+    let had_aggregations = hits.aggregations.take().is_some();
+
+    let aggs = (had_aggs || had_aggregations).then(|| {
+        let mut body = original.clone();
+        body.post_filter = None;
+        body.size = 0;
+        body.from = 0;
+        let mut params = params.clone();
+        // Query-string paging overrides the body, and a second scroll context
+        // would leak: this search only reads the aggregations.
+        params.size = Some("0".to_string());
+        params.from = None;
+        params.scroll = None;
+        (params, body)
+    });
+    Some(PostFilterSplit { hits, aggs })
+}
+
+/// Run the split searches and answer with the hits of one and the
+/// aggregations of the other. An error from either is returned as it is.
+async fn search_with_post_filter(
+    state: AppState,
+    index: String,
+    params: EsSearchQueryParams,
+    principal: crate::auth::Principal,
+    split: PostFilterSplit,
+) -> Response {
+    let hits_search = search_routed(
+        state.clone(),
+        index.clone(),
+        params,
+        principal.clone(),
+        EsSearchJson(Some(split.hits)),
+    );
+    let Some((aggs_params, aggs_body)) = split.aggs else {
+        return hits_search.await;
+    };
+    let aggs_search = search_routed(
+        state,
+        index,
+        aggs_params,
+        principal,
+        EsSearchJson(Some(aggs_body)),
+    );
+    let (hits_response, aggs_response) = tokio::join!(Box::pin(hits_search), Box::pin(aggs_search));
+    if !hits_response.status().is_success() {
+        return hits_response;
+    }
+    if !aggs_response.status().is_success() {
+        return aggs_response;
+    }
+
+    let (mut parts, hits_body) = hits_response.into_parts();
+    let read = |body: axum::body::Body| async move {
+        axum::body::to_bytes(body, usize::MAX)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    };
+    let (Some(mut merged), Some(aggs_value)) =
+        (read(hits_body).await, read(aggs_response.into_body()).await)
+    else {
+        return ApiError::new(xerj_common::XerjError::internal(
+            "post_filter: could not read the search responses to merge them",
+        ))
+        .into_response();
+    };
+    if let (Some(obj), Some(aggregations)) =
+        (merged.as_object_mut(), aggs_value.get("aggregations"))
+    {
+        obj.insert("aggregations".to_string(), aggregations.clone());
+    }
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(parts, axum::body::Body::from(merged.to_string()))
+}
+
+#[cfg(test)]
+mod post_filter_split_tests {
+    use super::*;
+
+    fn body(v: Value) -> EsSearchJson {
+        EsSearchJson(Some(serde_json::from_value(v).expect("search body")))
+    }
+
+    #[test]
+    fn no_post_filter_is_left_alone() {
+        let params = EsSearchQueryParams::default();
+        assert!(split_post_filter(&params, &body(json!({"query": {"match_all": {}}}))).is_none());
+        assert!(split_post_filter(&params, &EsSearchJson(None)).is_none());
+    }
+
+    #[test]
+    fn hits_search_wraps_the_query_and_drops_aggregations() {
+        let params = EsSearchQueryParams::default();
+        let split = split_post_filter(
+            &params,
+            &body(json!({
+                "query": {"match": {"body": "alpha"}},
+                "post_filter": {"term": {"provenance": "draft"}},
+            })),
+        )
+        .expect("split");
+        assert_eq!(
+            split.hits.query,
+            Some(json!({"bool": {
+                "must": [{"match": {"body": "alpha"}}],
+                "filter": [{"term": {"provenance": "draft"}}],
+            }}))
+        );
+        assert!(split.hits.post_filter.is_none());
+        assert!(split.aggs.is_none(), "no aggregations, no second search");
+    }
+
+    #[test]
+    fn a_missing_query_is_match_all() {
+        let split = split_post_filter(
+            &EsSearchQueryParams::default(),
+            &body(json!({"post_filter": {"term": {"provenance": "draft"}}})),
+        )
+        .expect("split");
+        assert_eq!(
+            split.hits.query.unwrap()["bool"]["must"][0],
+            json!({"match_all": {}})
+        );
+    }
+
+    #[test]
+    fn aggregations_come_from_the_unfiltered_request_with_no_hits_and_no_scroll() {
+        let params = EsSearchQueryParams {
+            size: Some("25".into()),
+            from: Some("5".into()),
+            scroll: Some("1m".into()),
+            ..Default::default()
+        };
+        let split = split_post_filter(
+            &params,
+            &body(json!({
+                "query": {"match_all": {}},
+                "size": 25,
+                "post_filter": {"term": {"provenance": "draft"}},
+                "aggs": {"p": {"terms": {"field": "provenance"}}},
+            })),
+        )
+        .expect("split");
+        assert!(split.hits.aggs.is_none() && split.hits.aggregations.is_none());
+        let (aggs_params, aggs_body) = split.aggs.expect("an aggregation search");
+        assert!(aggs_body.post_filter.is_none());
+        assert_eq!(aggs_body.query, Some(json!({"match_all": {}})));
+        assert_eq!((aggs_body.size, aggs_body.from), (0, 0));
+        assert!(aggs_body.aggs.is_some());
+        assert_eq!(aggs_params.size.as_deref(), Some("0"));
+        assert!(aggs_params.from.is_none() && aggs_params.scroll.is_none());
+    }
+
+    #[test]
+    fn hybrid_and_query_string_requests_are_not_split() {
+        let hybrid = body(json!({
+            "query": {"hybrid": {"queries": [
+                {"query": {"match": {"body": "alpha"}}},
+                {"query": {"match": {"body": "beta"}}},
+            ]}},
+            "post_filter": {"term": {"provenance": "draft"}},
+        }));
+        assert!(split_post_filter(&EsSearchQueryParams::default(), &hybrid).is_none());
+        let q_param = EsSearchQueryParams {
+            q: Some("body:alpha".into()),
+            ..Default::default()
+        };
+        let with_filter = body(json!({"post_filter": {"term": {"provenance": "draft"}}}));
+        assert!(split_post_filter(&q_param, &with_filter).is_none());
+    }
 }
 
 /// One shard's search, used by the cluster fan-out. Does not fan out again.
@@ -18754,7 +19066,22 @@ async fn search_impl(
             // and name the values that do exist. Only on zero hits, only for
             // exact clauses, and capped — this must never cost anything on a
             // query that worked.
-            if all_hints.is_empty() && hits.is_empty() {
+            //
+            // #2451: "zero hits" means the MATCH SET is empty, not the page. A
+            // `size: 0` request (a count or existence probe — autoindex's
+            // per-upsert `index_holds_content` is one) always has an empty
+            // page, so gating on `hits.is_empty()` alone ran the 256-row
+            // `match_all` sample — a full-source decode of ~356 rows, 1.4 s on
+            // a 234k-doc code index — after EVERY probe, hit or miss. The
+            // sample is for a caller who asked for hits and got none.
+            if all_hints.is_empty()
+                && zero_hit_value_sample_applies(
+                    body.size,
+                    hits.is_empty(),
+                    total_count,
+                    track_total_disabled,
+                )
+            {
                 let mut clauses = Vec::new();
                 if let Some(q) = body.query.as_ref() {
                     exact_term_clauses(q, &mut clauses);

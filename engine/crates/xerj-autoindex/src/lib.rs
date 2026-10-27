@@ -49,6 +49,7 @@ mod reconcile_plan;
 pub mod remove;
 pub mod resources;
 pub mod search;
+pub mod sessions;
 pub mod sniff;
 pub mod source;
 pub mod staleness;
@@ -4257,6 +4258,36 @@ fn scan_file(
             }
         })
         .collect();
+    // CSV, JSONL and logs declare no length, so `records` is the sample: it
+    // stops at `sample` rows (500 by default) or at the sample byte cap. A
+    // 100_000-row CSV then looked like a 500-row one, and the dataset caps
+    // (`dataset::DATASET_CAP_PROTECT_RECORDS`) merged it into a shared index
+    // as if it were small. When the sample may have stopped early, count on
+    // with the same extractor up to the protect threshold. That is enough to
+    // decide the caps and stays bounded however large the file is.
+    if matches!(sn.family, Family::Csv | Family::Jsonl | Family::Logs) {
+        let threshold = dataset::DATASET_CAP_PROTECT_RECORDS;
+        let sample_cut = |s: &GroupSketch| {
+            s.population < threshold
+                && (s.records >= sample as u64 || limit.is_some_and(|l| sn.gzip || size > l))
+        };
+        if out.sketches.iter().any(sample_cut) {
+            let groups_seen = out.sketches.len();
+            let mut counts: HashMap<Option<String>, u64> = HashMap::new();
+            let mut count = |rec: extract::RawRecord| -> bool {
+                *counts.entry(rec.group).or_default() += 1;
+                counts.len() < groups_seen || counts.values().any(|n| *n < threshold)
+            };
+            // A read error part-way still leaves a lower bound: every
+            // record counted was really there.
+            let _ = extract::extract(path, &sn, None, &mut count);
+            for s in &mut out.sketches {
+                if let Some(&n) = counts.get(&s.group) {
+                    s.population = s.population.max(n);
+                }
+            }
+        }
+    }
     out.sketches.sort_by(|a, b| a.group.cmp(&b.group));
     out.sniffed = Some(sn);
     out
@@ -4443,6 +4474,108 @@ mod clustering_key_tests {
             .expect("runs group");
         assert_eq!(runs.records, 2);
         assert_eq!(runs.population, 3);
+    }
+
+    fn csv_body(tag: &str, rows: usize) -> String {
+        let mut b = format!("{tag}_id,{tag}_name,{tag}_val\n");
+        for i in 0..rows {
+            b.push_str(&format!("{i},name{i},{}\n", i * 3));
+        }
+        b
+    }
+
+    fn jsonl_body(tag: &str, rows: usize) -> String {
+        let mut b = String::new();
+        for i in 0..rows {
+            b.push_str(&format!(
+                "{{\"{tag}_id\":{i},\"{tag}_name\":\"name{i}\",\"{tag}_val\":{}}}\n",
+                i * 3
+            ));
+        }
+        b
+    }
+
+    /// Line-record files declare no length, so the sample (500 rows) used to
+    /// be the population and a 2000-row CSV/JSONL counted as small (#2422).
+    /// Phase A now counts on to the protect threshold; a 10-row file still
+    /// reports exactly its 10 rows.
+    #[test]
+    fn a_sampled_line_record_file_reports_rows_past_the_sample() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("big.csv", csv_body("b", 2000)),
+            ("big.jsonl", jsonl_body("j", 2000)),
+        ] {
+            let s = scan(dir.path(), name, &body);
+            assert_eq!(s.sketches.len(), 1, "{name}");
+            let sk = &s.sketches[0];
+            assert_eq!(sk.records, 500, "{name}: the sample still stops at 500");
+            assert!(
+                sk.population >= dataset::DATASET_CAP_PROTECT_RECORDS,
+                "{name}: population {} is the sample, not the file",
+                sk.population
+            );
+        }
+        let small = scan(dir.path(), "small.csv", &csv_body("s", 10));
+        assert_eq!(small.sketches[0].records, 10);
+        assert_eq!(small.sketches[0].population, 10);
+    }
+
+    /// End to end through `cluster()`: past the run cap, 2000-row CSV and
+    /// JSONL files keep their own datasets, and the 10-row CSVs still merge
+    /// into one shared CSV dataset.
+    #[test]
+    fn past_the_run_cap_large_sampled_csv_and_jsonl_keep_their_own_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files: Vec<(String, String)> = Vec::new();
+        let n_big = dataset::MAX_DATASETS_PER_RUN + 2;
+        for i in 0..n_big {
+            files.push((format!("big{i}.csv"), csv_body(&format!("b{i}"), 2000)));
+        }
+        files.push(("big.jsonl".into(), jsonl_body("j", 2000)));
+        let n_small = 3;
+        for i in 0..n_small {
+            files.push((format!("small{i}.csv"), csv_body(&format!("s{i}"), 10)));
+        }
+        let mut rels = Vec::new();
+        let mut sketches = Vec::new();
+        for (idx, (name, body)) in files.iter().enumerate() {
+            let s = scan(dir.path(), name, body);
+            assert_eq!(s.sketches.len(), 1, "{name}");
+            let sk = &s.sketches[0];
+            sketches.push(dataset::Sketch {
+                file_idx: idx,
+                group: sk.group.clone(),
+                family: s.sniffed.as_ref().unwrap().family,
+                fields: sk.fields.clone(),
+                key_fields: sk.key_fields.clone(),
+                records: sk.records,
+                population: sk.population,
+            });
+            rels.push(name.clone());
+        }
+        let scopes = vec![String::new(); rels.len()];
+        let clusters = dataset::cluster(sketches, &rels, &scopes);
+        let data: Vec<&dataset::Cluster> = clusters.iter().filter(|c| !c.is_docs).collect();
+        let home = |idx: usize| {
+            data.iter()
+                .find(|c| c.members.contains(&idx))
+                .unwrap_or_else(|| panic!("{} has no data dataset: {clusters:#?}", rels[idx]))
+        };
+        // Every large file — the CSVs and the JSONL — is alone in its dataset.
+        for (idx, rel) in rels.iter().enumerate().take(n_big + 1) {
+            assert_eq!(home(idx).members, vec![idx], "{rel} was merged");
+        }
+        // The 10-row CSVs share one dataset, rows intact.
+        let shared = home(n_big + 1);
+        let mut members = shared.members.clone();
+        members.sort();
+        assert_eq!(
+            members,
+            (n_big + 1..n_big + 1 + n_small).collect::<Vec<_>>()
+        );
+        assert_eq!(shared.records, 10 * n_small as u64);
+        assert_eq!(data.len(), n_big + 2);
     }
 }
 
@@ -5246,18 +5379,17 @@ struct PhaseA {
 /// `--progress json` stays a single parseable stream (#241).
 fn report_pdf_spool_fallbacks(
     files: &[walk::FileEntry],
-    scans: &[FileScan],
+    fallbacks: &[(usize, Vec<extract::pdf::SpoolFallback>)],
     ctx: &PhaseAContext<'_>,
 ) {
     let pdf_spool_budget = ctx.budget;
     let pr = ctx.progress;
-    let reasons: Vec<(&str, &extract::pdf::SpoolFallback)> = scans
+    let reasons: Vec<(&str, &extract::pdf::SpoolFallback)> = fallbacks
         .iter()
-        .enumerate()
-        .flat_map(|(index, scan)| {
-            scan.pdf_spool_fallbacks
+        .flat_map(|(index, per_file)| {
+            per_file
                 .iter()
-                .map(move |fallback| (files[index].rel.as_str(), fallback))
+                .map(move |fallback| (files[*index].rel.as_str(), fallback))
         })
         .collect();
     for (path, fallback) in &reasons {
@@ -5295,6 +5427,13 @@ fn report_pdf_spool_fallbacks(
     }
 }
 
+/// Files phase A scans before folding their sketches into clusters. Large
+/// enough that the scan pool stays busy across a chunk, small enough that the
+/// sketches held at once stay bounded whatever the folder's file count.
+// Tests use a tiny chunk so every multi-file phase-A test crosses chunk
+// boundaries.
+const PHASE_A_CHUNK_FILES: usize = if cfg!(test) { 3 } else { 2048 };
+
 /// Sniff + sample every file, cluster into datasets, and assemble the plan.
 /// Pure planning: reads the tree, never the server — which is what makes the
 /// #173/#196 grouping behaviour testable end-to-end without a cluster.
@@ -5319,77 +5458,95 @@ fn build_phase_a(
     // Patterns were validated (loudly) at run start; a failure here would be
     // a programming error, not user input.
     let stub_matcher = StubMatcher::compile(&cfg.stub_globs).expect("validated at startup");
-    let scans: Vec<FileScan> = crate::pool::install(|| {
-        files
-            .par_iter()
-            .zip(digests.par_iter())
-            .map(|(f, digest)| {
-                let _in_flight = pr.file(&f.rel, f.size);
-                scan_file(
-                    &f.path,
-                    f.size,
-                    digest,
-                    ctx,
-                    cfg.sample,
-                    cfg.max_file_bytes,
-                    stub_matcher.matches(&f.rel),
-                )
-            })
-            .collect()
-    });
-
-    report_pdf_spool_fallbacks(files, &scans, ctx);
-    note_worker_address_space_cap(pr);
-
     let rels: Vec<String> = files.iter().map(|f| f.rel.clone()).collect();
     let scopes = compute_scopes(root, &rels);
     // (family, gzip) per file, from the scan's sniff — reused for assignments
     // and demoted-file re-sampling instead of re-sniffing every file.
-    let file_meta: Vec<Option<(Family, bool)>> = scans
-        .iter()
-        .map(|sc| sc.sniffed.as_ref().map(|s| (s.family, s.gzip)))
-        .collect();
-    let mut sketches = Vec::new();
+    let mut file_meta: Vec<Option<(Family, bool)>> = Vec::with_capacity(files.len());
     let mut junk_files = Vec::new();
     let mut pdf_spools: Vec<Option<extract::pdf::ExtractionSpool>> =
         (0..files.len()).map(|_| None).collect();
-    for (i, mut sc) in scans.into_iter().enumerate() {
-        let family = sc
-            .sniffed
-            .as_ref()
-            .map(|s| s.family)
-            .unwrap_or(Family::Binary);
-        // A file that phase A junks is never indexed, so its artifact is
-        // refunded here rather than held to the phase A→B boundary.
-        pdf_spools[i] =
-            take_pdf_spool_if_indexable(&mut sc.pdf_spool, sc.junk.is_some(), pdf_spool_budget);
-        if let Some((status, reason)) = sc.junk {
-            junk_files.push(JunkFile {
-                file_key: keys[i].clone(),
-                rel: files[i].rel.clone(),
-                format: format_str(sc.sniffed.as_ref()),
-                status,
-                reason,
-                bytes: files[i].size,
-            });
-            continue;
+    let mut pdf_fallbacks: Vec<(usize, Vec<extract::pdf::SpoolFallback>)> = Vec::new();
+    // Scan in file-ordered chunks and fold each chunk's sketches into the
+    // clusters before the next chunk is scanned. Collecting every file's scan
+    // first held one set of field accumulators per file for the whole folder
+    // at once: 4.4 GB of client RSS on a 146k-file tree before anything was
+    // indexed (part of #1122). Folding in file order keeps the clustering
+    // identical to the collect-all version (see `dataset::Clusterer`).
+    let mut clusterer = dataset::Clusterer::default();
+    let mut start = 0usize;
+    while start < files.len() {
+        let end = (start + PHASE_A_CHUNK_FILES).min(files.len());
+        let scans: Vec<FileScan> = crate::pool::install(|| {
+            files[start..end]
+                .par_iter()
+                .zip(digests[start..end].par_iter())
+                .map(|(f, digest)| {
+                    let _in_flight = pr.file(&f.rel, f.size);
+                    scan_file(
+                        &f.path,
+                        f.size,
+                        digest,
+                        ctx,
+                        cfg.sample,
+                        cfg.max_file_bytes,
+                        stub_matcher.matches(&f.rel),
+                    )
+                })
+                .collect()
+        });
+        for (offset, mut sc) in scans.into_iter().enumerate() {
+            let i = start + offset;
+            file_meta.push(sc.sniffed.as_ref().map(|s| (s.family, s.gzip)));
+            if !sc.pdf_spool_fallbacks.is_empty() {
+                pdf_fallbacks.push((i, std::mem::take(&mut sc.pdf_spool_fallbacks)));
+            }
+            let family = sc
+                .sniffed
+                .as_ref()
+                .map(|s| s.family)
+                .unwrap_or(Family::Binary);
+            // A file that phase A junks is never indexed, so its artifact is
+            // refunded here rather than held to the phase A→B boundary.
+            pdf_spools[i] =
+                take_pdf_spool_if_indexable(&mut sc.pdf_spool, sc.junk.is_some(), pdf_spool_budget);
+            if let Some((status, reason)) = sc.junk {
+                junk_files.push(JunkFile {
+                    file_key: keys[i].clone(),
+                    rel: files[i].rel.clone(),
+                    format: format_str(sc.sniffed.as_ref()),
+                    status,
+                    reason,
+                    bytes: files[i].size,
+                });
+                continue;
+            }
+            for gs in sc.sketches {
+                clusterer.push(
+                    dataset::Sketch {
+                        file_idx: i,
+                        group: gs.group,
+                        family,
+                        fields: gs.fields,
+                        key_fields: gs.key_fields,
+                        records: gs.records,
+                        population: gs.population,
+                    },
+                    &scopes[i],
+                );
+            }
         }
-        for gs in sc.sketches {
-            sketches.push(dataset::Sketch {
-                file_idx: i,
-                group: gs.group,
-                family,
-                fields: gs.fields,
-                key_fields: gs.key_fields,
-                records: gs.records,
-                population: gs.population,
-            });
-        }
+        start = end;
     }
-    let mut clusters = dataset::cluster(sketches, &rels, &scopes);
+
+    report_pdf_spool_fallbacks(files, &pdf_fallbacks, ctx);
+    note_worker_address_space_cap(pr);
+
+    let mut clusters = clusterer.finish(&rels);
     // `{prefix}-{slug}` must not stutter (`logs-logs-syslog`) when the slug's
     // first segment is the prefix the operator already chose.
     dataset::drop_repeated_prefix(&cfg.prefix, &mut clusters);
+    dataset::cap_slug_len(&mut clusters);
 
     // Demoted one-off config files (#173) were sampled as flattened records;
     // phase B will index them as documents. Re-sample them through the same
@@ -9562,7 +9719,9 @@ fn run_index_report_inner(
     }
 
     // ── Phase A: inference (skipped when a frozen plan exists) ──────────
-    let mut clusters_rt: Option<Vec<dataset::Cluster>> = None;
+    // Only what end-of-run correlation needs; the phase-A clusters (every
+    // field's full accumulator) are dropped as soon as the plan is built.
+    let mut key_stats: Option<correlate::KeyStats> = None;
     let mut pdf_spools: Vec<Option<extract::pdf::ExtractionSpool>> =
         (0..files.len()).map(|_| None).collect();
     // Both worker widths come from the one resource policy (#240), and since
@@ -9627,7 +9786,8 @@ fn run_index_report_inner(
             plan.datasets.len() as u64,
             plan.junk_files.len() as u64,
         ));
-        clusters_rt = Some(clusters);
+        key_stats = Some(correlate::key_stats(&clusters));
+        drop(clusters);
         plan
     };
     let unreadable_keys: HashSet<String> = inventory
@@ -11340,10 +11500,20 @@ fn run_index_report_inner(
     // an error: workers that did start share the queue, the pipe stops
     // counting the ones that never did, and if none started this thread
     // works the queue itself. The failed closure is dropped unrun.
+    // #2428: a refused spawn is retried with backoff first; a transient
+    // `EAGAIN` must not cost the run a worker, let alone the run.
     xerj_common::thread_spawn::scope(|scope| {
         let mut started = 0usize;
         for _ in 0..worker_count {
-            match scope.spawn("autoindex-worker", worker) {
+            match crate::sync_executor::spawn_scoped_with_backoff(
+                scope,
+                &xerj_common::thread_spawn::StdSpawn,
+                xerj_common::thread_spawn::spawn_allowed,
+                "autoindex-worker",
+                crate::sync_executor::WORKER_SPAWN_ATTEMPTS,
+                crate::sync_executor::WORKER_SPAWN_BACKOFF,
+                worker,
+            ) {
                 Ok(_) => started += 1,
                 Err(error) => {
                     pr.note(&format!(
@@ -11666,32 +11836,8 @@ fn run_index_report_inner(
 
     // correlations
     let mut key_corrs: Vec<correlate::KeyCorr> = Vec::new();
-    if let Some(clusters) = &clusters_rt {
-        let mut cands = Vec::new();
-        for (c, d) in clusters.iter().zip(plan.datasets.iter()) {
-            for spec in &d.specs {
-                let Some(acc) = c.fields.get(&spec.name) else {
-                    continue;
-                };
-                if correlate::is_candidate(
-                    &spec.es_type,
-                    spec.semantic.as_deref(),
-                    acc.distinct.len(),
-                    acc.n,
-                    acc.distinct_overflow,
-                    (acc.long_ok > 0).then_some((acc.int_min, acc.int_max)),
-                ) {
-                    cands.push(correlate::Candidate {
-                        slug: d.slug.clone(),
-                        index: d.index.clone(),
-                        field: spec.name.clone(),
-                        kind: spec.es_type.clone(),
-                        values: acc.raw_values.clone(),
-                        sampled_n: acc.n,
-                    });
-                }
-            }
-        }
+    if let Some(stats) = &key_stats {
+        let cands = correlate::candidates(stats, &plan.datasets);
         key_corrs = correlate::key_overlaps(&cands);
         // One live query per candidate overlap, and the bound is known before
         // the loop starts — `phase=finalize-correlate items=37/135` needs no

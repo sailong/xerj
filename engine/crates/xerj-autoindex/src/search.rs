@@ -24,7 +24,8 @@ USAGE:
 
 OPTIONS:
     --url <U>       node endpoint (default $XERJ_URL or http://localhost:9200)
-    --prefix <P>    index prefix to search (default \"ax\" — what `xerj autoindex` writes)
+    --prefix <P>    one index prefix to search (default \"ax\" — what `xerj autoindex` writes);
+                    no comma lists
     --api-key <K>   Authorization (or $XERJ_API_KEY; --insecure nodes need none)
     -k <N>          number of passages to return (default 5). A non-number is a
                     usage error, not a silent default
@@ -605,8 +606,47 @@ pub struct ResolvedPrefix {
 /// characters the caller typed (`My_Proj-*`) misses the corpus those
 /// commands wrote (`my-proj-*`). `xerj search`, `xerj def`, and the
 /// `xerj_search` MCP tool all call this, so the three cannot drift.
+///
+/// A comma is refused, not a list (#2405): `a,b` sanitises into the single
+/// prefix `a-b` and would search `a-b-*`, a corpus no autoindex run wrote.
+/// The rewrite note cannot fix that silently, so the error names the stored
+/// value and the per-prefix alternatives instead.
 pub fn resolve_prefix(prefix: &str) -> Result<ResolvedPrefix, String> {
     let trimmed = prefix.trim();
+    if trimmed.contains(',') {
+        let stored = crate::dataset::sanitize_prefix(trimmed);
+        let parts: Vec<String> = trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(crate::dataset::sanitize_prefix)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let mut err = format!(
+            "{trimmed:?} names more than one prefix. --prefix takes exactly one: \
+             a comma is not a list separator, and this value would have been \
+             stored as {stored:?} and searched {stored}-*, which no autoindex run wrote."
+        );
+        if parts.len() >= 2 {
+            let flags = parts
+                .iter()
+                .map(|p| format!("--prefix {p}"))
+                .collect::<Vec<_>>()
+                .join(", then ");
+            let patterns = parts
+                .iter()
+                .map(|p| format!("{p}-*"))
+                .collect::<Vec<_>>()
+                .join(",");
+            err.push_str(&format!(
+                " Run one search per prefix ({flags}), or query the node directly: \
+                 POST /{patterns}/_search"
+            ));
+        } else if let [part] = parts.as_slice() {
+            err.push_str(&format!(" Pass that part alone: --prefix {part}."));
+        }
+        return Err(err);
+    }
     if trimmed.is_empty() {
         return Err(
             "must contain at least one [a-z0-9] character; for example \"project\" searches project-*"
@@ -762,6 +802,21 @@ fn parse_search_cli(
 }
 
 /// Entry point for the `search` subcommand. Returns a process exit code.
+/// Start the staleness check on its own thread so it overlaps the search.
+/// The check uses its own blocking client with a short timeout.
+fn spawn_staleness_check(
+    url: &str,
+    api_key: Option<&str>,
+    prefix: &str,
+) -> std::thread::JoinHandle<Option<staleness::StalenessHint>> {
+    let (url, api_key, prefix) = (
+        url.to_string(),
+        api_key.map(str::to_string),
+        prefix.to_string(),
+    );
+    std::thread::spawn(move || staleness::check(&url, api_key.as_deref(), &prefix))
+}
+
 pub fn run_search_cli() -> i32 {
     let url = std::env::var("XERJ_URL")
         .ok()
@@ -884,7 +939,13 @@ pub fn run_search_cli() -> i32 {
     if code_corpus && k > 0 {
         body["size"] = json!(search_fetch_size(k));
     }
-    let mut resp = match es.search(&pattern, &body) {
+    // The catalog read and mtime walk run beside the query instead of after
+    // it. On a cold node the catalog's sorted run lookup was ~0.26 s on top
+    // of the search (#2422). A failed search exits without waiting for it.
+    // A missing catalog, a remote folder, or a check that hits its cap leaves
+    // the response unchanged (#2345).
+    let stale = spawn_staleness_check(&url, api_key.as_deref(), &prefix);
+    let mut resp = match es.search_without_savings(&pattern, &body) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{}", query_failure_message("search", &url, &pattern, e));
@@ -901,10 +962,7 @@ pub fn run_search_cli() -> i32 {
     // header cite the matched line. `xerj code --json` is the raw server
     // body and does not share this hit post-pass.
     xerj_common::xccode::passage::annotate_search_match_lines(&mut resp, &query);
-    // After the query, so a failed search does not pay for the catalog read.
-    // A missing catalog, a remote folder, or a check that hits its cap leaves
-    // the response unchanged (#2345).
-    let hint = staleness::check(&url, api_key.as_deref(), &prefix);
+    let hint = stale.join().ok().flatten();
     if as_json {
         if let Some(hint) = &hint {
             staleness::attach(&mut resp, hint);
@@ -979,6 +1037,38 @@ pub fn run_search_cli() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The CLI's catalog read must overlap the query, not follow it (#2422).
+    /// A catalog that answers after 600 ms must not hold up the caller.
+    #[test]
+    fn staleness_check_runs_beside_the_search_instead_of_after_it() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            let body = r#"{"hits":{"hits":[]}}"#;
+            let _ = write!(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        });
+        let started = std::time::Instant::now();
+        let handle = spawn_staleness_check(&url, None, "sr");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(300),
+            "starting the check blocked for {:?}",
+            started.elapsed()
+        );
+        // No run doc in the catalog, so no hint, once it has answered.
+        assert!(handle.join().unwrap().is_none());
+        assert!(started.elapsed() >= std::time::Duration::from_millis(500));
+        server.join().unwrap();
+    }
     use xerj_common::code_query::normalize_code_search_query;
 
     /// `My_Proj` is stored as `my-proj-*`. Searching the typed characters
@@ -1037,6 +1127,22 @@ mod tests {
             "search must not talk about a walk it does not do: {digit}"
         );
         assert!(digit.contains("lowercase letter"), "{digit}");
+    }
+
+    /// #2405: `a,b` sanitises to `a-b` and searches `a-b-*`, a corpus no
+    /// autoindex run wrote. The comma is a refusal, not a list.
+    #[test]
+    fn a_comma_list_is_refused_not_joined() {
+        let err = resolve_prefix("a,b").unwrap_err();
+        assert!(err.contains("\"a-b\""), "{err}");
+        assert!(err.contains("a-*,b-*"), "{err}");
+        assert!(err.contains("--prefix a"), "{err}");
+        assert!(err.contains("--prefix b"), "{err}");
+        let err = resolve_prefix(" refsec , refdoc ").unwrap_err();
+        assert!(err.contains("refsec-*,refdoc-*"), "{err}");
+        let err = resolve_prefix("My_Proj,Other").unwrap_err();
+        assert!(err.contains("my-proj-*,other-*"), "{err}");
+        assert!(prefix_from_scope(Some("a,b"), None).is_none());
     }
 
     #[test]

@@ -58,6 +58,17 @@ pub struct SnapshotFile {
     /// this file therefore also means "a pre-#971 snapshot: never reuse".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prepared_identity: Option<String>,
+    /// #2421: the sealed blob was deleted once this file's prepared artifact
+    /// was durable. Nothing after preparation reads the blob — replay, resume
+    /// and metadata updates all stream `prepared.relative_ndjson` — so keeping
+    /// a second copy of every indexed source byte made the state dir larger
+    /// than the corpus. Only ever true with `prepared: Some`; `open_snapshot`
+    /// then verifies the artifact instead of the blob, and a later generation
+    /// reuses the artifact by identity or re-copies from the verified live
+    /// source. Skip-serialized when false so a manifest sealed before this
+    /// field existed keeps hashing to the digest the journal recorded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blob_released: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -344,6 +355,83 @@ pub(crate) fn replay_windowed<T: Sync>(
     hooks: &mut dyn ReplayHooks<T>,
     apply: &(dyn Fn(&T) -> Result<()> + Sync),
 ) -> Result<()> {
+    replay_windowed_with(
+        &xerj_common::thread_spawn::StdSpawn,
+        xerj_common::thread_spawn::spawn_allowed,
+        items,
+        width,
+        hooks,
+        apply,
+    )
+}
+
+/// How many times a refused worker spawn is retried before the run
+/// continues with the workers it already has (#2428).
+pub(crate) const WORKER_SPAWN_ATTEMPTS: u32 = 3;
+/// First pause after a refused worker spawn; doubled on each retry.
+pub(crate) const WORKER_SPAWN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Start `f` on a scoped helper thread, retrying a refused spawn (`EAGAIN`
+/// from `pthread_create`, or the spawn gate saying no) up to `attempts`
+/// times with a doubling `backoff` (#2428). A refused spawn is a transient
+/// thread or memory limit, not a reason to lose the run: `Err` after the
+/// last attempt means `f` never ran and the caller carries on with the
+/// threads it has, or does the work itself.
+pub(crate) fn spawn_scoped_with_backoff<'scope, 'env, S, G, F>(
+    scope: &xerj_common::thread_spawn::Scope<'scope, 'env>,
+    spawner: &S,
+    gate: G,
+    name: &str,
+    attempts: u32,
+    backoff: std::time::Duration,
+    f: F,
+) -> std::io::Result<()>
+where
+    S: xerj_common::thread_spawn::Spawn + ?Sized,
+    G: Fn() -> bool,
+    F: FnOnce() + Send + Copy + 'scope,
+{
+    let attempts = attempts.max(1);
+    let mut delay = backoff;
+    let mut attempt = 1;
+    loop {
+        match scope.spawn_with(spawner, gate(), name, f) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt >= attempts => return Err(error),
+            Err(_) => {
+                std::thread::sleep(delay);
+                delay = delay.saturating_mul(2);
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// [`replay_windowed`] with an explicit spawner and spawn gate, so the
+/// spawn-failure paths are testable without exhausting a real machine.
+///
+/// #2428: the window used to start one thread per *operation*. A corpus
+/// replay is hundreds of thousands of operations, so a long run made
+/// hundreds of thousands of `pthread_create` calls, and under memory or
+/// thread pressure one of them eventually got `EAGAIN`. Now at most
+/// `width` workers are started once per replay and reused for every item.
+/// A refused worker spawn is retried with backoff; if it is still refused
+/// the replay continues on the workers that did start, and if none did,
+/// every item is applied on the calling thread. Ordering and failure
+/// semantics are unchanged.
+pub(crate) fn replay_windowed_with<T, S, G>(
+    spawner: &S,
+    gate: G,
+    items: &[T],
+    width: usize,
+    hooks: &mut dyn ReplayHooks<T>,
+    apply: &(dyn Fn(&T) -> Result<()> + Sync),
+) -> Result<()>
+where
+    T: Sync,
+    S: xerj_common::thread_spawn::Spawn + ?Sized,
+    G: Fn() -> bool,
+{
     if items.is_empty() {
         return Ok(());
     }
@@ -355,19 +443,68 @@ pub(crate) fn replay_windowed<T: Sync>(
         }
         return Ok(());
     }
-    /// One dispatched operation: on its own thread, or — when that thread
-    /// could not be started (#1122) — already applied inline.
-    enum Dispatched<'scope> {
-        Thread(xerj_common::thread_spawn::ScopedJoinHandle<'scope, Result<()>>),
+    /// One dispatched operation: queued to a worker, or — when no worker
+    /// could be started (#1122, #2428) — already applied inline.
+    enum Dispatched {
+        Worker(std::sync::mpsc::Receiver<Result<()>>),
         Inline(Result<()>),
     }
+    type Job<'a, T> = (&'a T, std::sync::mpsc::Sender<Result<()>>);
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<Job<'_, T>>();
+    let job_rx = std::sync::Mutex::new(job_rx);
+    let job_rx = &job_rx;
+    // A worker takes queued items until the sender is dropped. A panic in
+    // `apply` (unwind builds) becomes that item's error and the worker
+    // keeps serving the queue.
+    let worker = move || loop {
+        let job = {
+            let rx = job_rx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            rx.recv()
+        };
+        let Ok((item, reply)) = job else { break };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| apply(item)))
+            .unwrap_or_else(|panic| {
+                Err(anyhow::anyhow!(
+                    "replay apply panicked: {}",
+                    panic_message(panic)
+                ))
+            });
+        // The scheduler may have stopped listening after a `begin` error.
+        let _ = reply.send(outcome);
+    };
     // #1122: `Builder::spawn_scoped` can abort the process after returning
     // `Ok`, when the child cannot map its alternate signal stack. This
-    // scope uses `pthread_create`. A refusal applies the item on this
-    // thread; the closure that would have run it is dropped unrun.
+    // scope uses `pthread_create`.
     let failure = xerj_common::thread_spawn::scope(|scope| -> Result<Option<anyhow::Error>> {
+        let wanted = width.min(items.len());
+        let mut workers = 0usize;
+        while workers < wanted {
+            match spawn_scoped_with_backoff(
+                scope,
+                spawner,
+                &gate,
+                "xerj-sync-apply",
+                WORKER_SPAWN_ATTEMPTS,
+                WORKER_SPAWN_BACKOFF,
+                worker,
+            ) {
+                Ok(()) => workers += 1,
+                Err(error) => {
+                    eprintln!(
+                        "autoindex: could not start replay worker {} of {wanted} ({error}); \
+                         continuing with {} (#2428)",
+                        workers + 1,
+                        workers.max(1)
+                    );
+                    break;
+                }
+            }
+        }
+        let job_tx = job_tx;
         let mut next = items.iter();
-        let mut in_flight: std::collections::VecDeque<(&T, Dispatched<'_>)> =
+        let mut in_flight: std::collections::VecDeque<(&T, Dispatched)> =
             std::collections::VecDeque::new();
         let mut failure: Option<anyhow::Error> = None;
         loop {
@@ -377,11 +514,15 @@ pub(crate) fn replay_windowed<T: Sync>(
                 // was never dispatched is also never recorded as begun.
                 let Some(item) = next.next() else { break };
                 hooks.begin(item)?;
-                let dispatched = item;
-                let slot = match scope.spawn_returning("xerj-sync-apply", move || apply(dispatched))
-                {
-                    Ok(handle) => Dispatched::Thread(handle),
-                    Err(_) => Dispatched::Inline(apply(item)),
+                let slot = if workers > 0 {
+                    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                    match job_tx.send((item, reply_tx)) {
+                        Ok(()) => Dispatched::Worker(reply_rx),
+                        // Unreachable while `job_rx` lives; apply inline.
+                        Err(_) => Dispatched::Inline(apply(item)),
+                    }
+                } else {
+                    Dispatched::Inline(apply(item))
                 };
                 in_flight.push_back((item, slot));
             }
@@ -389,11 +530,8 @@ pub(crate) fn replay_windowed<T: Sync>(
                 break;
             };
             let outcome = match slot {
-                Dispatched::Thread(handle) => handle.join().unwrap_or_else(|panic| {
-                    Err(anyhow::anyhow!(
-                        "replay apply panicked: {}",
-                        panic_message(panic)
-                    ))
+                Dispatched::Worker(reply) => reply.recv().unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!("replay worker exited before applying"))
                 }),
                 Dispatched::Inline(outcome) => outcome,
             };
@@ -403,6 +541,7 @@ pub(crate) fn replay_windowed<T: Sync>(
                 failure = Some(error);
             }
         }
+        // Dropping `job_tx` here ends the workers; the scope joins them.
         Ok(failure)
     })?;
     match failure {
@@ -950,8 +1089,9 @@ impl<'a> EsSyncBackend<'a> {
     /// `credit` ticks the current phase once per window after that window's
     /// answer is in. The capability probe passes `false`: it is one sample,
     /// not one of the phase's windows, and a tick there would walk the bar
-    /// past its denominator. A `timed_out` page bails before the tick, so a
-    /// partial window is not counted as zero and is not credited (#1761).
+    /// past its denominator. A `timed_out` window is re-asked, bounded, and
+    /// only its exhaustion bails before the tick, so a partial window is
+    /// not counted as zero and is not credited (#1761, #2405).
     fn windowed_value_counts(
         &self,
         index: &str,
@@ -966,11 +1106,18 @@ impl<'a> EsSyncBackend<'a> {
             let mut filter = Vec::with_capacity(1 + extra_filters.len());
             filter.push(serde_json::json!({"terms": {field: window}}));
             filter.extend(extra_filters.iter().cloned());
-            // #2222: `search_for_verify`, not `search`. A DELETE of this
-            // index while the window is in flight used to leave the caller
-            // parked on it (`waiting_on` the deleted name) until the
-            // transport budget ran out, and the generation never committed.
-            let response = self.es.search_for_verify(
+            // #2222 + #2405: `search_page_for_verify`, not `search`. A
+            // DELETE of this index while the window is in flight used to
+            // leave the caller parked on it (`waiting_on` the deleted name)
+            // until the transport budget ran out, and the generation never
+            // committed; and a `timed_out` answer used to exit 1 on the
+            // first partial page. The call re-asks the same window, bounded,
+            // and still fails fast on a deleted index. A deadline page is
+            // HTTP 200 with `timed_out` and an empty aggregation — counting
+            // it as "every digest is absent" would abort a generation whose
+            // rows are on the node, so exhaustion stays a loud error and is
+            // never counted as zero (#1761).
+            let response = self.es.search_page_for_verify(
                 index,
                 &serde_json::json!({
                     "size": 0,
@@ -980,18 +1127,6 @@ impl<'a> EsSyncBackend<'a> {
                     "aggs": {"values": {"terms": {"field": field, "size": window.len()}}}
                 }),
             )?;
-            // A deadline page is HTTP 200 with `timed_out` and an empty
-            // aggregation. Counting it as "every digest is absent" aborts a
-            // generation whose rows are on the node (#1761's concurrent
-            // catalog writer hits this deadline). Say so; rerunning resumes.
-            if response.get("timed_out") == Some(&Value::Bool(true)) {
-                anyhow::bail!(
-                    "finalize-verify search on {index} returned timed_out: the page is partial \
-                     and is not a live count (a concurrent writer on this index can hold \
-                     publication across the deadline). Nothing from this window was counted — \
-                     rerun the same command, which resumes"
-                );
-            }
             for bucket in response
                 .pointer("/aggregations/values/buckets")
                 .and_then(Value::as_array)
@@ -1049,7 +1184,7 @@ impl<'a> EsSyncBackend<'a> {
                     "catalog read-back window needed more than {MAX_PAGES} pages"
                 );
                 pages += 1;
-                let response = self.es.search(
+                let response = self.es.search_page(
                     crate::catalog::CATALOG_INDEX,
                     &serde_json::json!({
                         "size": PAGE,
@@ -1062,16 +1197,6 @@ impl<'a> EsSyncBackend<'a> {
                         ]}}
                     }),
                 )?;
-                if response.get("timed_out") == Some(&Value::Bool(true)) {
-                    anyhow::bail!(
-                        "finalize-verify search on {} returned timed_out: the page is partial \
-                         and is not a live catalog count (a concurrent corpus build publishing \
-                         to this shared index can hold the publication bracket across the \
-                         deadline). Nothing from this window was counted — rerun the same \
-                         command, which resumes",
-                        crate::catalog::CATALOG_INDEX
-                    );
-                }
                 let page_total = response
                     .pointer("/hits/total/value")
                     .and_then(Value::as_u64)
@@ -1110,9 +1235,10 @@ impl<'a> EsSyncBackend<'a> {
             );
             // One tick per window, after the window's pages have all come
             // back. The phase denominator is windows, not pages (#1267).
-            // A `timed_out` page bails above, so a partial catalog window is
-            // not counted as zero and the phase does not sit at 0/N while
-            // another corpus publishes to this shared index (#1761).
+            // `search_page` re-asks a `timed_out` page and bails only on
+            // exhaustion, so a partial catalog window is not counted as
+            // zero and the phase does not sit at 0/N while another corpus
+            // publishes to this shared index (#1761, #2405).
             credit_verify_items(self.pr, 1);
         }
         Ok(counts)
@@ -3204,6 +3330,16 @@ fn create_snapshot_inner(
             .copied()
             .filter(|prior| {
                 prior.content_digest == *content_digest && prior.content_size == source.size
+            })
+            // #2421: a prior file whose blob was released can only be reused
+            // through its prepared artifact. If the preparation identity moved,
+            // there are no sealed bytes to re-extract from, so it re-seals from
+            // the live source (verified against this run's digest) below.
+            .filter(|prior| {
+                !prior.blob_released
+                    || (prior.prepared.is_some()
+                        && prior.prepared_identity.is_some()
+                        && prior.prepared_identity == prepared_identity)
             });
         match reusable {
             Some(prior) => {
@@ -3211,13 +3347,15 @@ fn create_snapshot_inner(
                     .as_ref()
                     .expect("reuse root exists whenever reuse_by_content is non-empty")
                     .join(&prior.relative_blob);
-                std::fs::hard_link(&prior_blob, &destination).with_context(|| {
-                    format!(
-                        "hardlink unchanged snapshot blob {} -> {}",
-                        prior_blob.display(),
-                        destination.display()
-                    )
-                })?;
+                if !prior.blob_released {
+                    std::fs::hard_link(&prior_blob, &destination).with_context(|| {
+                        format!(
+                            "hardlink unchanged snapshot blob {} -> {}",
+                            prior_blob.display(),
+                            destination.display()
+                        )
+                    })?;
+                }
                 budget.charge(source.size as usize)?;
                 let prepared = match &prior.prepared {
                     Some(prior_artifact)
@@ -3268,6 +3406,7 @@ fn create_snapshot_inner(
                         None => None,
                     },
                 };
+                let blob_released = release_prepared_blob(&destination, prepared.as_ref())?;
                 files.push(SnapshotFile {
                     content_id: content_id.clone(),
                     content_digest: content_digest.clone(),
@@ -3275,6 +3414,7 @@ fn create_snapshot_inner(
                     relative_blob,
                     prepared,
                     prepared_identity,
+                    blob_released,
                 });
             }
             None => {
@@ -3313,6 +3453,7 @@ fn create_snapshot_inner(
                     )?),
                     None => None,
                 };
+                let blob_released = release_prepared_blob(&destination, prepared.as_ref())?;
                 files.push(SnapshotFile {
                     content_id: content_id.clone(),
                     content_digest: content_digest.clone(),
@@ -3320,6 +3461,7 @@ fn create_snapshot_inner(
                     relative_blob,
                     prepared,
                     prepared_identity,
+                    blob_released,
                 });
             }
         }
@@ -3374,6 +3516,28 @@ fn create_snapshot_inner(
     open_snapshot(state_dir, tx_id)
 }
 
+/// #2421: once a file's prepared artifact is durable (`prepare_artifact`
+/// fsyncs it before returning), its sealed blob has served its only purpose —
+/// a stable input for extraction — so it is unlinked from the staging dir
+/// before the manifest is written. The blob is a hardlink when reused, so this
+/// never touches the prior generation's copy. Files with nothing prepared
+/// (junk/skipped, or a plan-less snapshot) keep their blob.
+fn release_prepared_blob(destination: &Path, prepared: Option<&PreparedArtifact>) -> Result<bool> {
+    if prepared.is_none() {
+        return Ok(false);
+    }
+    match std::fs::remove_file(destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("release prepared snapshot blob {}", destination.display())
+            })
+        }
+    }
+    Ok(true)
+}
+
 pub fn open_snapshot(state_dir: &Path, tx_id: &str) -> Result<SourceSnapshot> {
     validate_tx_id(tx_id)?;
     let dir = state_dir.join("sync-snapshots").join(tx_id);
@@ -3419,11 +3583,20 @@ pub fn open_snapshot(state_dir: &Path, tx_id: &str) -> Result<SourceSnapshot> {
                 && !Path::new(&file.relative_blob).is_absolute(),
             "invalid source snapshot blob path"
         );
-        crate::content::verify(
-            &dir.join(&file.relative_blob),
-            file.content_size,
-            &file.content_digest,
-        )?;
+        if file.blob_released {
+            // #2421: the bytes live only in the prepared artifact, which is
+            // size- and digest-verified below.
+            anyhow::ensure!(
+                file.prepared.is_some(),
+                "source snapshot released a blob that has no prepared artifact"
+            );
+        } else {
+            crate::content::verify(
+                &dir.join(&file.relative_blob),
+                file.content_size,
+                &file.content_digest,
+            )?;
+        }
         if let Some(prepared) = &file.prepared {
             validate_relative_path(&prepared.relative_ndjson, "prepared/")?;
             let path = dir.join(&prepared.relative_ndjson);
@@ -4283,11 +4456,22 @@ mod tests {
             .unwrap()
             .ino()
         };
-        let prior_blob_inodes: std::collections::HashSet<_> = first
+        // #2421: every prepared file's blob is released at seal, in both
+        // generations — reuse carries the prepared artifact, not the bytes.
+        for (snapshot, file) in first
             .files
             .iter()
-            .map(|file| artifact_inode(&first, &file.relative_blob))
-            .collect();
+            .map(|file| (&first, file))
+            .chain(second.files.iter().map(|file| (&second, file)))
+        {
+            assert!(file.blob_released, "{}", file.content_id);
+            assert!(!state
+                .path()
+                .join("sync-snapshots")
+                .join(&snapshot.tx_id)
+                .join(&file.relative_blob)
+                .exists());
+        }
 
         for file in &second.files {
             let new_prepared = file.prepared.as_ref().unwrap();
@@ -4298,10 +4482,6 @@ mod tests {
                 None => {
                     // The changed file: everything sealed fresh, under the new
                     // generation's identity.
-                    assert!(
-                        !prior_blob_inodes.contains(&artifact_inode(&second, &file.relative_blob)),
-                        "the changed file's blob must be a fresh inode"
-                    );
                     let ndjson = std::fs::read_to_string(
                         state
                             .path()
@@ -4315,11 +4495,6 @@ mod tests {
                     );
                 }
                 Some(prior) => {
-                    assert_eq!(
-                        artifact_inode(&first, &prior.relative_blob),
-                        artifact_inode(&second, &file.relative_blob),
-                        "an unchanged file's blob must be the prior generation's inode"
-                    );
                     let prior_prepared = prior.prepared.as_ref().unwrap();
                     assert_eq!(
                         artifact_inode(&first, &prior_prepared.relative_ndjson),
@@ -4346,6 +4521,136 @@ mod tests {
         // hardlinked or not.
         let reopened = open_snapshot(state.path(), "tx-g2").unwrap();
         assert_eq!(reopened, second);
+    }
+
+    /// #2421: a committed generation's snapshot used to hold a full copy of
+    /// every source byte (`blobs/`) next to the prepared NDJSON, so the state
+    /// dir was larger than the corpus it indexed. With prepared blobs released
+    /// at seal, nothing under `blobs/` survives, and what the protected
+    /// snapshots hold beyond the prepared records a resume replays from —
+    /// counted per inode, so hardlinked reuse is not double-counted — stays
+    /// under 1x the source after a commit and after the next generation's gc.
+    /// (The prepared records themselves are the replay authority; their size
+    /// depends on the corpus: overlapping text chunks run above the source,
+    /// compacted JSON below it.)
+    #[cfg(unix)]
+    #[test]
+    fn committed_snapshot_keeps_no_source_copy_beside_its_prepared_records() {
+        use std::os::unix::fs::MetadataExt;
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        for file in 0..8 {
+            let body: String = (0..400)
+                .map(|line| format!("file {file} line {line}: the quick brown fox jumps over it\n"))
+                .collect();
+            std::fs::write(corpus.path().join(format!("f{file}.md")), body).unwrap();
+        }
+        // (bytes beyond the prepared records, prepared bytes)
+        let footprint = |state: &Path| -> (u64, u64) {
+            let mut seen = std::collections::HashSet::new();
+            let mut other = 0;
+            let mut prepared = 0;
+            for entry in walkdir::WalkDir::new(state.join("sync-snapshots")) {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_file() && seen.insert(metadata.ino()) {
+                    let parts: Vec<_> = entry.path().components().collect();
+                    let under = |dir: &str| parts.iter().any(|part| part.as_os_str() == dir);
+                    assert!(
+                        !under("blobs"),
+                        "a released snapshot keeps no source copy: {}",
+                        entry.path().display()
+                    );
+                    if under("prepared") {
+                        prepared += metadata.len();
+                    } else {
+                        other += metadata.len();
+                    }
+                }
+            }
+            (other, prepared)
+        };
+        let seal = |tx: &str, prior: Option<&SourceSnapshot>| {
+            let inventory = inventory(corpus.path());
+            let plan = plan_for_all(&inventory);
+            let source: u64 = inventory.files.iter().map(|file| file.size).sum();
+            let snapshot = create_prepared_snapshot_reporting(
+                state.path(),
+                tx,
+                &inventory,
+                &plan,
+                "test-preparation-v1",
+                u64::MAX,
+                &crate::progress::Progress::silent(),
+                prior,
+                "chunker-v1",
+                None,
+            )
+            .unwrap();
+            (snapshot, source)
+        };
+        let (first, source) = seal("tx-g1", None);
+        let (used, prepared) = footprint(state.path());
+        assert!(prepared > 0);
+        assert!(
+            used < source,
+            "snapshot bytes beyond the prepared records ({used}) must stay below the \
+             {source}-byte source"
+        );
+        assert!(first.files.iter().all(|file| file.blob_released));
+
+        std::fs::write(corpus.path().join("f3.md"), "changed\n").unwrap();
+        let (second, source) = seal("tx-g2", Some(&first));
+        // What gc does once g2 is the committed authority.
+        std::fs::remove_dir_all(state.path().join("sync-snapshots/tx-g1")).unwrap();
+        let (used, _) = footprint(state.path());
+        assert!(
+            used < source,
+            "after gc the bytes beyond the prepared records ({used}) must stay below the \
+             {source}-byte source"
+        );
+        assert_eq!(open_snapshot(state.path(), "tx-g2").unwrap(), second);
+    }
+
+    /// #2421: a released blob is never silently trusted. The prepared artifact
+    /// that replaces it is still size- and digest-verified on every open.
+    #[test]
+    fn released_blob_snapshot_still_verifies_its_prepared_artifact() {
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let corpus = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::write(corpus.path().join("a.md"), "alpha contents one\n").unwrap();
+        let inventory = inventory(corpus.path());
+        let plan = plan_for_all(&inventory);
+        let snapshot = create_prepared_snapshot(
+            state.path(),
+            "tx-released",
+            &inventory,
+            &plan,
+            "test-preparation-v1",
+            u64::MAX,
+        )
+        .unwrap();
+        assert!(snapshot.files[0].blob_released);
+        let artifact = state
+            .path()
+            .join("sync-snapshots/tx-released")
+            .join(&snapshot.files[0].prepared.as_ref().unwrap().relative_ndjson);
+        let original = std::fs::read(&artifact).unwrap();
+        let mut corrupt = original.clone();
+        corrupt[0] ^= 0x20;
+        std::fs::write(&artifact, &corrupt).unwrap();
+        assert!(open_snapshot(state.path(), "tx-released").is_err());
+        std::fs::write(&artifact, &original).unwrap();
+        assert_eq!(
+            open_snapshot(state.path(), "tx-released").unwrap(),
+            snapshot
+        );
     }
 
     /// #971: gc removes the prior snapshot's directory entries after a new
@@ -4409,10 +4714,11 @@ mod tests {
 
     /// #971: a preparation-input change (chunker identity) busts prepared
     /// reuse even when the bytes are identical — the artifact is re-extracted
-    /// under the new contract, while the blob itself is still shared.
+    /// under the new contract. #2421: the prior blob was released at seal, so
+    /// the bytes are re-sealed from the verified live source and released again.
     #[cfg(unix)]
     #[test]
-    fn changed_preparation_identity_reextracts_but_still_shares_the_blob() {
+    fn changed_preparation_identity_reextracts_from_the_live_source() {
         let _guard = SNAPSHOT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4463,11 +4769,8 @@ mod tests {
                 )
         };
         let inode = |path: std::path::PathBuf| std::fs::metadata(path).unwrap().ino();
-        assert_eq!(
-            inode(blob(&first)),
-            inode(blob(&second)),
-            "identical content still shares the blob"
-        );
+        assert!(!blob(&first).exists() && !blob(&second).exists());
+        assert!(first.files[0].blob_released && second.files[0].blob_released);
         // The artifacts live in different snapshot directories under the same
         // ordinal name, so compare inodes, not relative paths.
         let prepared = |snapshot: &SourceSnapshot| {
@@ -5061,10 +5364,10 @@ mod tests {
             assert!(document.get("id").is_none(), "{document}");
             assert!(document.get("value").is_none(), "{document}");
         }
-        assert_eq!(
-            std::fs::read(root.join(&snapshot.files[0].relative_blob)).unwrap(),
-            sealed
-        );
+        // #2421: the sealed bytes served extraction and were then released;
+        // the artifact above is the durable copy.
+        assert!(snapshot.files[0].blob_released);
+        assert!(!root.join(&snapshot.files[0].relative_blob).exists());
     }
 
     /// #294: snapshot blobs are content-addressed and extensionless
@@ -5623,6 +5926,176 @@ mod tests {
             vec![(0, false), (1, true), (2, true), (3, true)],
             "the drain still reports the applies that did land"
         );
+    }
+
+    /// A spawner that refuses its first `refuse` calls with `EAGAIN`, as
+    /// `pthread_create` does under thread or memory pressure, then starts
+    /// real threads. Counts every call (#2428).
+    struct FlakySpawn {
+        refuse: usize,
+        calls: std::sync::atomic::AtomicUsize,
+        started: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakySpawn {
+        fn refusing(refuse: usize) -> Self {
+            FlakySpawn {
+                refuse,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                started: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl xerj_common::thread_spawn::Spawn for FlakySpawn {
+        fn spawn(
+            &self,
+            name: &str,
+            job: xerj_common::thread_spawn::BoxedJob,
+        ) -> std::io::Result<xerj_common::thread_spawn::SpawnedThread> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call < self.refuse {
+                return Err(std::io::Error::from_raw_os_error(11));
+            }
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            xerj_common::thread_spawn::StdSpawn.spawn(name, job)
+        }
+    }
+
+    #[test]
+    fn replay_windowed_reuses_at_most_width_workers_for_a_long_replay() {
+        // #2428: one thread per operation was hundreds of thousands of
+        // `pthread_create` calls over a corpus replay. The window must start
+        // at most `width` workers once and reuse them.
+        let items: Vec<usize> = (0..500).collect();
+        let spawner = FlakySpawn::refusing(0);
+        let threads = std::sync::Mutex::new(std::collections::HashSet::new());
+        let apply = |_item: &usize| {
+            threads.lock().unwrap().insert(std::thread::current().id());
+            Ok(())
+        };
+        let mut hooks = WindowHooks::default();
+        replay_windowed_with(&spawner, || true, &items, 4, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.begun, items);
+        assert_eq!(hooks.applied.len(), items.len());
+        assert!(hooks.applied.iter().all(|(_, ok)| *ok));
+        let spawned = spawner.calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            spawned <= 4,
+            "500 operations at width 4 must start at most 4 threads, started {spawned}"
+        );
+        assert!(threads.lock().unwrap().len() <= 4);
+    }
+
+    #[test]
+    fn replay_windowed_completes_inline_when_every_worker_spawn_is_refused() {
+        // #2428: EAGAIN on every spawn is a slower replay, not a lost run.
+        let items: Vec<usize> = (0..20).collect();
+        let spawner = FlakySpawn::refusing(usize::MAX);
+        let caller = std::thread::current().id();
+        let threads = std::sync::Mutex::new(std::collections::HashSet::new());
+        let apply = |_item: &usize| {
+            threads.lock().unwrap().insert(std::thread::current().id());
+            Ok(())
+        };
+        let mut hooks = WindowHooks::default();
+        replay_windowed_with(&spawner, || true, &items, 4, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.begun, items);
+        assert_eq!(
+            hooks
+                .applied
+                .iter()
+                .map(|(item, _)| *item)
+                .collect::<Vec<_>>(),
+            items,
+            "every item applied and reported in dispatch order"
+        );
+        assert!(hooks.applied.iter().all(|(_, ok)| *ok));
+        assert_eq!(
+            *threads.lock().unwrap(),
+            std::collections::HashSet::from([caller]),
+            "with no worker, every apply runs on the calling thread"
+        );
+        assert_eq!(spawner.started.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            spawner.calls.load(std::sync::atomic::Ordering::SeqCst),
+            WORKER_SPAWN_ATTEMPTS as usize,
+            "the first worker is retried with backoff, then the replay goes inline"
+        );
+    }
+
+    #[test]
+    fn replay_windowed_retries_a_transient_spawn_refusal() {
+        // Two EAGAINs, then the OS has threads again: the retry gets the
+        // worker instead of giving up on it.
+        let items: Vec<usize> = (0..50).collect();
+        let spawner = FlakySpawn::refusing(2);
+        let apply = |_item: &usize| Ok(());
+        let mut hooks = WindowHooks::default();
+        replay_windowed_with(&spawner, || true, &items, 3, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.applied.len(), items.len());
+        assert!(hooks.applied.iter().all(|(_, ok)| *ok));
+        assert_eq!(
+            spawner.started.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "all three workers started after the transient refusals"
+        );
+    }
+
+    #[test]
+    fn replay_windowed_continues_on_the_workers_that_started() {
+        // Spawn succeeds once, then EAGAIN forever: the replay finishes on
+        // that one worker.
+        struct OneThenRefuse(std::sync::atomic::AtomicUsize);
+        impl xerj_common::thread_spawn::Spawn for OneThenRefuse {
+            fn spawn(
+                &self,
+                name: &str,
+                job: xerj_common::thread_spawn::BoxedJob,
+            ) -> std::io::Result<xerj_common::thread_spawn::SpawnedThread> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    xerj_common::thread_spawn::StdSpawn.spawn(name, job)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(11))
+                }
+            }
+        }
+        let items: Vec<usize> = (0..40).collect();
+        let spawner = OneThenRefuse(std::sync::atomic::AtomicUsize::new(0));
+        let apply = |_item: &usize| Ok(());
+        let mut hooks = WindowHooks::default();
+        replay_windowed_with(&spawner, || true, &items, 4, &mut hooks, &apply).unwrap();
+        assert_eq!(hooks.begun, items);
+        assert_eq!(
+            hooks
+                .applied
+                .iter()
+                .map(|(item, _)| *item)
+                .collect::<Vec<_>>(),
+            items
+        );
+    }
+
+    #[test]
+    fn spawn_scoped_with_backoff_gives_up_after_the_attempts_without_running_the_job() {
+        let spawner = FlakySpawn::refusing(usize::MAX);
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let ran_ref = &ran;
+        let result = xerj_common::thread_spawn::scope(|scope| {
+            spawn_scoped_with_backoff(
+                scope,
+                &spawner,
+                || true,
+                "test-worker",
+                3,
+                std::time::Duration::from_millis(1),
+                move || ran_ref.store(true, std::sync::atomic::Ordering::SeqCst),
+            )
+        });
+        assert!(result.is_err());
+        assert_eq!(spawner.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     /// A backend whose Nth `apply` is the server still answering 429 after
@@ -6564,6 +7037,241 @@ mod tests {
         assert_eq!(counts.get("digest-a"), Some(&3));
         assert_eq!(counts.get("digest-b"), Some(&0));
         server.join().unwrap();
+    }
+
+    /// A scripted node for the finalize-verify retry tests (#2405). Every
+    /// connection gets its own handler thread so a `_search` in flight
+    /// cannot starve the `HEAD` probe `search_for_verify` may send while a
+    /// search is unanswered. `HEAD` always answers 200 (the index lives);
+    /// each `_search` records its request body and answers with the next
+    /// scripted response — the last one repeats when the script runs out,
+    /// so a caller that keeps re-asking past the script is still answered.
+    struct ScriptedSearch {
+        address: std::net::SocketAddr,
+        search_bodies: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ScriptedSearch {
+        fn start(script: &[&str]) -> Self {
+            use std::io::{Read, Write};
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{Arc, Mutex};
+            use std::time::Duration;
+
+            fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+                                let length = head
+                                    .lines()
+                                    .find_map(|line| {
+                                        line.to_ascii_lowercase()
+                                            .strip_prefix("content-length:")
+                                            .and_then(|v| v.trim().parse::<usize>().ok())
+                                    })
+                                    .unwrap_or(0);
+                                let have = buf.len() - (end + 4);
+                                if have >= length {
+                                    return (head, buf[end + 4..end + 4 + length].to_vec());
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).into_owned();
+                (head, Vec::new())
+            }
+
+            fn write_json(stream: &mut std::net::TcpStream, body: &str) {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let search_bodies = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let script: Arc<Mutex<std::collections::VecDeque<String>>> =
+                Arc::new(Mutex::new(script.iter().map(|s| s.to_string()).collect()));
+            let bodies_srv = Arc::clone(&search_bodies);
+            let stop_srv = Arc::clone(&stop);
+            let script_srv = Arc::clone(&script);
+            let server = std::thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !stop_srv.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let bodies_one = Arc::clone(&bodies_srv);
+                            let script_one = Arc::clone(&script_srv);
+                            handlers.push(std::thread::spawn(move || {
+                                let mut stream = stream;
+                                stream.set_nonblocking(false).unwrap();
+                                let (head, body) = read_request(&mut stream);
+                                if head.starts_with("HEAD ") {
+                                    write_json(&mut stream, "{}");
+                                } else if head.contains("_search") {
+                                    let parsed =
+                                        serde_json::from_slice(&body).unwrap_or(Value::Null);
+                                    bodies_one.lock().unwrap().push(parsed);
+                                    let answer = {
+                                        let mut scripted = script_one.lock().unwrap();
+                                        if scripted.len() > 1 {
+                                            scripted.pop_front().unwrap()
+                                        } else {
+                                            scripted
+                                                .front()
+                                                .cloned()
+                                                .unwrap_or_else(|| "{}".to_string())
+                                        }
+                                    };
+                                    write_json(&mut stream, &answer);
+                                } else {
+                                    write_json(&mut stream, "{}");
+                                }
+                            }));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for handler in handlers {
+                    let _ = handler.join();
+                }
+            });
+            ScriptedSearch {
+                address,
+                search_bodies,
+                stop,
+                server: Some(server),
+            }
+        }
+
+        fn searches(&self) -> Vec<Value> {
+            self.search_bodies.lock().unwrap().clone()
+        }
+
+        fn es(&self) -> crate::esclient::Es {
+            crate::esclient::Es::new(&format!("http://{}", self.address), None).unwrap()
+        }
+
+        fn shutdown(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Unblock `accept` if it is parked.
+            let _ = std::net::TcpStream::connect(self.address);
+            if let Some(server) = self.server.take() {
+                server.join().unwrap();
+            }
+        }
+    }
+
+    impl Drop for ScriptedSearch {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    /// #2405: a `timed_out` window used to exit 1 on the spot. The window
+    /// is re-asked — with the page timeout the body lacked — and the second
+    /// answer counts.
+    #[test]
+    fn finalize_verify_window_retries_a_timed_out_answer() {
+        let mut server = ScriptedSearch::start(&[
+            r#"{"timed_out":true,"hits":{"hits":[]}}"#,
+            r#"{"aggregations":{"values":{"buckets":[{"key":"digest-a","doc_count":3}]}}}"#,
+        ]);
+        let es = server.es();
+        let dir = tempfile::tempdir().unwrap();
+        let pr = crate::progress::Progress::silent();
+        let backend = EsSyncBackend::new(&es, dir.path(), 8 * 1024 * 1024, &pr);
+        let counts = backend
+            .windowed_value_counts(
+                "xc-retry",
+                "ax_file",
+                &["digest-a".into(), "digest-b".into()],
+                &[],
+                false,
+            )
+            .unwrap();
+        assert_eq!(counts.get("digest-a"), Some(&3));
+        assert_eq!(counts.get("digest-b"), Some(&0));
+        let searches = server.searches();
+        assert_eq!(
+            searches.len(),
+            2,
+            "one retry, not a page storm: {searches:?}"
+        );
+        for body in &searches {
+            assert_eq!(
+                body.get("timeout").and_then(Value::as_str),
+                Some("120s"),
+                "the retried window must carry the page timeout: {body}"
+            );
+        }
+        server.shutdown();
+    }
+
+    /// The retry is bounded: a node that answers every attempt partial
+    /// gets the loud error, not an infinite wait, and the window was never
+    /// counted.
+    #[test]
+    fn finalize_verify_window_fails_loud_when_every_attempt_times_out() {
+        let mut server = ScriptedSearch::start(&[r#"{"timed_out":true,"hits":{"hits":[]}}"#]);
+        let es = server.es();
+        let dir = tempfile::tempdir().unwrap();
+        let pr = crate::progress::Progress::silent();
+        let backend = EsSyncBackend::new(&es, dir.path(), 8 * 1024 * 1024, &pr);
+        let error = backend
+            .windowed_value_counts("xc-wedged", "ax_file", &["digest-a".into()], &[], false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("xc-wedged"), "{error}");
+        assert!(error.contains("timed_out"), "{error}");
+        assert!(error.contains("consecutive attempts"), "{error}");
+        assert!(error.contains("rerun the same command"), "{error}");
+        assert_eq!(
+            server.searches().len(),
+            crate::esclient::PARTIAL_PAGE_ATTEMPTS,
+        );
+        server.shutdown();
+    }
+
+    /// The catalog read-back's `search_page` leg retries the same way.
+    #[test]
+    fn catalog_read_back_window_retries_a_timed_out_page() {
+        let mut server = ScriptedSearch::start(&[
+            r#"{"timed_out":true,"hits":{"hits":[]}}"#,
+            r#"{"timed_out":false,"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"x","_source":{"file_key":"k1"}}]}}"#,
+        ]);
+        let es = server.es();
+        let dir = tempfile::tempdir().unwrap();
+        let pr = crate::progress::Progress::silent();
+        let backend = EsSyncBackend::new(&es, dir.path(), 8 * 1024 * 1024, &pr);
+        let counts = backend
+            .windowed_catalog_counts(&["k1".into()], "run-1")
+            .unwrap();
+        assert_eq!(counts.get("k1"), Some(&1));
+        assert_eq!(server.searches().len(), 2);
+        server.shutdown();
     }
 
     #[test]

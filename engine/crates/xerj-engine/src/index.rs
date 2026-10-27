@@ -105,6 +105,128 @@ async fn await_publication_barrier<T>(rx: tokio::sync::oneshot::Receiver<T>, wha
     }
 }
 
+/// Forcemerge batch selection over segments sorted smallest first: chunks
+/// of at most `chunk_len` segments whose input stays under `cap` bytes
+/// (`0` = no cap, #948). Returns index lists into `sizes`.
+///
+/// Convergence: when every segment is already larger than half the cap,
+/// no chunk can hold two, and the old selection returned nothing — an
+/// explicit `max_num_segments=1` stopped at 2+ segments (seen on a 2 GiB
+/// cap: two 16-27 MB segments vs a 32 MiB batch cap). In that case the two
+/// smallest segments are merged anyway: one minimal batch is the least an
+/// explicit force-merge must do to make progress, and the caller loops
+/// passes until it reaches its target.
+pub(crate) fn forcemerge_chunks(sizes: &[u64], chunk_len: usize, cap: u64) -> Vec<Vec<usize>> {
+    let chunk_len = chunk_len.max(2);
+    let mut chunks: Vec<Vec<usize>> = Vec::new();
+    let mut batch: Vec<usize> = Vec::new();
+    let mut batch_bytes = 0u64;
+    for (i, &size) in sizes.iter().enumerate() {
+        if !batch.is_empty()
+            && (batch.len() >= chunk_len || (cap > 0 && batch_bytes.saturating_add(size) > cap))
+        {
+            chunks.push(std::mem::take(&mut batch));
+            batch_bytes = 0;
+        }
+        batch_bytes = batch_bytes.saturating_add(size);
+        batch.push(i);
+    }
+    if !batch.is_empty() {
+        chunks.push(batch);
+    }
+    chunks.retain(|c| c.len() >= 2);
+    if chunks.is_empty() && sizes.len() >= 2 {
+        chunks.push(vec![0, 1]);
+    }
+    chunks
+}
+
+#[cfg(test)]
+mod forcemerge_chunks_tests {
+    use super::forcemerge_chunks;
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn segments_over_the_cap_still_converge_to_one() {
+        // The corpus200 case: two segments, each over half a 32 MiB cap.
+        assert_eq!(
+            forcemerge_chunks(&[16 * MIB, 27 * MIB], 16, 32 * MIB),
+            vec![vec![0, 1]]
+        );
+        // Three oversized segments: merge the two smallest this pass.
+        assert_eq!(
+            forcemerge_chunks(&[40 * MIB, 50 * MIB, 60 * MIB], 16, 32 * MIB),
+            vec![vec![0, 1]]
+        );
+    }
+
+    #[test]
+    fn cap_and_count_still_split_batches() {
+        let sizes = [MIB; 5];
+        assert_eq!(
+            forcemerge_chunks(&sizes, 2, 0),
+            vec![vec![0, 1], vec![2, 3]]
+        );
+        assert_eq!(
+            forcemerge_chunks(&[10 * MIB, 10 * MIB, 10 * MIB, 10 * MIB], 16, 25 * MIB),
+            vec![vec![0, 1], vec![2, 3]]
+        );
+    }
+
+    #[test]
+    fn one_segment_is_nothing_to_do() {
+        assert!(forcemerge_chunks(&[MIB], 16, 32 * MIB).is_empty());
+        assert!(forcemerge_chunks(&[], 16, 32 * MIB).is_empty());
+    }
+}
+
+/// Whether a merge runs the level-19 long-effort stored encode
+/// (`encode_stored_v2_forcemerge_at_level`).
+///
+/// An explicit `_forcemerge` always does: the operator asked for the
+/// smallest index. A background (tiered) merge does only when the
+/// operator opts in with `XERJ_MERGE_MAX_EFFORT=true|1|yes|on`. Since
+/// rc.78 every background merge ran it, which made the stored encode ~35x
+/// slower and held the breaker latched (429 to ingest) for the whole merge.
+pub(crate) fn merge_uses_long_effort_stored_encode(
+    explicit_forcemerge: bool,
+    opt_in: Option<&str>,
+) -> bool {
+    if explicit_forcemerge {
+        return true;
+    }
+    matches!(
+        opt_in.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+#[cfg(test)]
+mod merge_long_effort_tests {
+    use super::merge_uses_long_effort_stored_encode as uses;
+
+    #[test]
+    fn background_merge_uses_fast_encode_by_default() {
+        assert!(!uses(false, None));
+        assert!(!uses(false, Some("")));
+        assert!(!uses(false, Some("false")));
+        assert!(!uses(false, Some("0")));
+    }
+
+    #[test]
+    fn forcemerge_always_uses_long_effort_encode() {
+        assert!(uses(true, None));
+        assert!(uses(true, Some("false")));
+    }
+
+    #[test]
+    fn background_long_effort_is_opt_in() {
+        for v in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(uses(false, Some(v)), "{v}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod collection_publication_fail_closed_tests {
     use super::*;
@@ -544,6 +666,63 @@ mod collection_publication_fail_closed_tests {
     /// spellings, and a flush that lands them in ONE segment (the 2-core CI
     /// shape) built the lying column — `terms {b:["true"]}` then returned the
     /// pre-upgrade document and silently dropped the coerced one.
+    /// #2427: the merge builds doc-values from its merged stored JSON one
+    /// document at a time instead of holding every `_source` tree. The
+    /// columns must match what the held trees produced, ordinals included:
+    /// a document with no `_source`, a non-object `_source`, and one that
+    /// does not parse as an object each keep their row.
+    #[test]
+    fn merge_doc_value_sources_matches_held_source_trees() {
+        let docs = [
+            json!({"_id": "a", "_seq_no": 1, "_source": {"k": "x", "n": 1, "b": true}}),
+            json!({"_id": "b", "_seq_no": 2}),
+            json!({"_id": "c", "_seq_no": 3, "_source": {"k": "y", "n": 2.5, "arr": [1, 2]}}),
+            json!({"_id": "d", "_seq_no": 4, "_source": "not-an-object"}),
+            json!({"_id": "e", "_seq_no": 5, "_source": {"k": "z", "msg": "hello"}}),
+        ];
+        let mut merged = b"[".to_vec();
+        for (i, doc) in docs.iter().enumerate() {
+            if i > 0 {
+                merged.push(b',');
+            }
+            merged.extend_from_slice(serde_json::to_string(doc).unwrap().as_bytes());
+        }
+        // A raw element that is not an object takes a row too.
+        merged.extend_from_slice(b",42]");
+
+        let mut skip = std::collections::HashSet::new();
+        skip.insert("msg".to_string());
+
+        // The pre-#2427 input: one held `_source` tree per document.
+        let mut held: Vec<Value> = docs
+            .iter()
+            .map(|doc| doc.get("_source").cloned().unwrap_or(Value::Null))
+            .collect();
+        held.push(Value::Null);
+        let expected = super::build_doc_value_columns(held.iter().map(Some), &skip);
+
+        let streamed = super::build_doc_value_columns(
+            super::merge_doc_value_sources(&merged).expect("array parses"),
+            &skip,
+        );
+        assert_eq!(
+            format!("{streamed:?}"),
+            format!("{expected:?}"),
+            "streamed doc-values must equal the held-tree build"
+        );
+        assert!(streamed.contains_key("k") && streamed.contains_key("n"));
+        assert!(
+            !streamed.contains_key("arr"),
+            "multi-valued field ships no column"
+        );
+        assert_eq!(
+            super::merge_doc_value_sources(&merged).unwrap().count(),
+            docs.len() + 1,
+            "one item per merged document, in order"
+        );
+        assert!(super::merge_doc_value_sources(b"not json").is_err());
+    }
+
     #[test]
     fn build_doc_value_columns_ships_nothing_for_a_type_mixed_field() {
         let legacy = json!({"b": "true", "n": "5", "ok": "kw"});
@@ -1834,6 +2013,471 @@ mod flush_publication_recovery_tests {
         let idx = restarted.get_index("bm25-failed-publication").unwrap();
         idx.abort_background_tasks();
         assert_eq!(idx.search(&request).await.unwrap().hits[0].id, "survivor");
+    }
+
+    fn topk_projection_schema() -> Schema {
+        let mut schema = Schema::empty();
+        for f in ["title", "body", "blob"] {
+            schema
+                .add_field(FieldConfig::new(f, FieldType::Text))
+                .unwrap();
+        }
+        schema
+    }
+
+    /// #2422: a broad query (most rows of a segment match) on a cold
+    /// segment used to decode the whole stored section inline, because the
+    /// first segment a page meets has no score floor and every matching row
+    /// was a candidate. The walk must read only identities and hydrate the
+    /// page's winners, with or without a `_source` projection, and a walk
+    /// that rejects thousands of rows (here: the best ones are deleted) must
+    /// still see every row, so every answer equals the warm answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_broad_topk_reads_identities_and_hydrates_only_winners() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("broad-cold", topk_projection_schema())
+            .unwrap();
+        let idx = engine.get_index("broad-cold").unwrap();
+        idx.abort_background_tasks();
+        for i in 0..4096u64 {
+            let body = if i % 2 == 0 {
+                format!("needle stack report {i} needle")
+            } else {
+                format!("hay stack {i}")
+            };
+            idx.index_document(
+                Some(format!("doc-{i}")),
+                json!({"title": format!("title {i}"), "body": body, "blob": "x"}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.flush().await.unwrap();
+        // Delete the best-scoring needle rows, more than the row window
+        // holds, so the walk rejects every row in the window and must read
+        // the live needle rows past it.
+        for i in (0..4000u64).step_by(2) {
+            assert!(idx.delete_document(&format!("doc-{i}")).await.unwrap());
+        }
+        idx.flush().await.unwrap();
+        drop(idx);
+        drop(engine);
+
+        let reopen = || {
+            let mut c = Config::default();
+            c.server.data_dir = dir.path().to_string_lossy().into_owned();
+            let engine = crate::Engine::new(c).unwrap();
+            let idx = engine.get_index("broad-cold").unwrap();
+            idx.abort_background_tasks();
+            // Hold the background warm back so each query is observed alone.
+            let snapshot = idx.store.snapshot();
+            let segs: Vec<_> = snapshot.segments.clone();
+            drop(snapshot);
+            assert!(
+                segs.iter().any(|s| s.doc_count > 1024),
+                "precondition: a segment large enough to exceed the row window"
+            );
+            for s in &segs {
+                idx.cold_stored_warms.insert(s.id.to_string(), ());
+            }
+            (engine, idx, segs)
+        };
+        let all_cold = |idx: &Index, segs: &[xerj_storage::segment::SegmentMeta]| {
+            segs.iter().all(|s| {
+                !idx.stored_slices_cache.contains_key(&s.id)
+                    && !idx.decoded_stored_cache.contains_key(&s.id)
+            })
+        };
+        let key = |r: &xerj_query::executor::SearchResult| -> Vec<(String, u32, Value)> {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), h.score.to_bits(), h.source.clone()))
+                .collect()
+        };
+        let request = |q: &str, projected: bool| {
+            let mut body = json!({
+                "query": {"match": {"body": q}},
+                "size": 5,
+            });
+            if projected {
+                body["_source"] = json!(["title"]);
+            }
+            xerj_query::parse_request(&body).unwrap()
+        };
+        let mut requests = Vec::new();
+        for projected in [true, false] {
+            // Every document matches; the live hay rows score highest.
+            requests.push(request("hay stack", projected));
+            // Matches the needle rows only. The best ~2000 of them are
+            // deleted, so the walk rejects thousands of rows first.
+            requests.push(request("needle report", projected));
+        }
+
+        let (engine, idx, segs) = reopen();
+        let mut cold = Vec::new();
+        for r in &requests {
+            cold.push(idx.search(r).await.unwrap());
+            assert!(
+                all_cold(&idx, &segs),
+                "a 5-hit query must not decode the whole stored section"
+            );
+        }
+        assert!(idx.cold_row_hydrations.load(Ordering::Relaxed) > 0);
+        drop(idx);
+        drop(engine);
+
+        let (engine, idx, segs) = reopen();
+        // Warm every segment that can be warmed; the large one (the walk
+        // under test) must be, so the reference takes the full-decode path.
+        for s in &segs {
+            let warmed = idx.stored_slices_for(&s.id, s.doc_count).is_some();
+            assert!(warmed || s.doc_count <= 1024, "segment {} must warm", s.id);
+        }
+        for (r, cold) in requests.iter().zip(&cold) {
+            let warm = idx.search(r).await.unwrap();
+            assert_eq!(cold.hits.len(), 5);
+            assert_eq!(key(cold), key(&warm));
+            assert_eq!(cold.total.value, warm.total.value);
+            assert_eq!(
+                cold.hits
+                    .iter()
+                    .filter(|h| h.source["title"].is_string())
+                    .count(),
+                5
+            );
+        }
+        for (i, h) in [&cold[1], &cold[3]]
+            .iter()
+            .flat_map(|r| r.hits.iter())
+            .enumerate()
+        {
+            let n: u64 = h.id.trim_start_matches("doc-").parse().unwrap();
+            assert!(
+                n >= 4000 && n.is_multiple_of(2),
+                "live needle rows only: {i} {}",
+                h.id
+            );
+        }
+        // Unprojected hits carry the whole source.
+        assert!(cold[2].hits.iter().all(|h| h.source["body"].is_string()));
+        drop(idx);
+        drop(engine);
+    }
+
+    /// #2422/#2423: on a cold segment (after a restart, or evicted under the
+    /// cache budget) a top-k query that names its `_source` fields must read
+    /// only the winning rows and only the needed columns. Before the fix the
+    /// first query decoded the whole stored section — every column of every
+    /// document, ~3.2 s on a 300 MB corpus — to return 5 hits. The answer
+    /// must equal the full-decode answer, and the full stored caches must
+    /// stay cold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_topk_with_source_includes_reads_only_winning_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("topk-cold", topk_projection_schema())
+            .unwrap();
+        let idx = engine.get_index("topk-cold").unwrap();
+        idx.abort_background_tasks();
+        let blob = "0.125 33.9 -118.4 ".repeat(200);
+        for i in 0..4096u64 {
+            let body = if i % 97 == 0 {
+                format!("needle report {i} needle")
+            } else {
+                format!("hay stack {i}")
+            };
+            idx.index_document(
+                Some(format!("doc-{i}")),
+                json!({"title": format!("title {i}"), "body": body, "blob": blob}),
+            )
+            .await
+            .unwrap();
+        }
+        idx.flush().await.unwrap();
+        drop(idx);
+        drop(engine);
+
+        let reopen = || {
+            let mut c = Config::default();
+            c.server.data_dir = dir.path().to_string_lossy().into_owned();
+            let engine = crate::Engine::new(c).unwrap();
+            let idx = engine.get_index("topk-cold").unwrap();
+            idx.abort_background_tasks();
+            (engine, idx)
+        };
+        let all_cold = |idx: &Index| {
+            let snapshot = idx.store.snapshot();
+            let segs: Vec<_> = snapshot.segments.clone();
+            drop(snapshot);
+            assert!(!segs.is_empty());
+            segs.iter().all(|s| {
+                !idx.stored_slices_cache.contains_key(&s.id)
+                    && !idx.decoded_stored_cache.contains_key(&s.id)
+            })
+        };
+
+        let projected = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "needle"}},
+            "size": 5,
+            "_source": ["title"]
+        }))
+        .unwrap();
+        assert_eq!(projected.savings, xerj_query::ast::SavingsMode::Off);
+        assert!(
+            fts_row_hydration_keep(&projected, &projected.query).is_some(),
+            "the request shape must be eligible for column projection"
+        );
+
+        let (engine, idx) = reopen();
+        assert!(
+            all_cold(&idx),
+            "precondition: stored caches cold after restart"
+        );
+        // Hold the background warm back so the query is observed alone.
+        let held: Vec<String> = {
+            let snapshot = idx.store.snapshot();
+            snapshot.segments.iter().map(|s| s.id.to_string()).collect()
+        };
+        for id in &held {
+            idx.cold_stored_warms.insert(id.clone(), ());
+        }
+        let cold = idx.search(&projected).await.unwrap();
+        assert!(
+            all_cold(&idx),
+            "a 5-hit query must not decode the whole stored section"
+        );
+        assert!(idx.cold_row_hydrations.load(Ordering::Relaxed) > 0);
+        // Released, the next cold visit warms the segment off the query path,
+        // so later queries with other winners read the warm cache.
+        idx.cold_stored_warms.clear();
+        let other = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "report"}},
+            "size": 5,
+            "_source": ["title"]
+        }))
+        .unwrap();
+        let again = idx.search(&other).await.unwrap();
+        assert_eq!(again.hits.len(), 5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while all_cold(&idx) || !idx.cold_stored_warms.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background warm never landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(cold.hits.len(), 5);
+        for h in &cold.hits {
+            let n: u64 = h.id.trim_start_matches("doc-").parse().unwrap();
+            assert_eq!(n % 97, 0, "hit {} does not match the query", h.id);
+            assert_eq!(h.source, json!({"title": format!("title {n}")}));
+        }
+        drop(idx);
+        drop(engine);
+
+        // Same query, every column, warm full decode: same ids, order and
+        // scores.
+        let full = xerj_query::parse_request(&json!({
+            "query": {"match": {"body": "needle"}},
+            "size": 5
+        }))
+        .unwrap();
+        let (_engine, idx) = reopen();
+        let warm_full = idx.search(&full).await.unwrap();
+        let warm_projected = idx.search(&projected).await.unwrap();
+        let key = |r: &xerj_query::executor::SearchResult| {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), (h.score * 1e4).round() as i64))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(key(&cold), key(&warm_full));
+        assert_eq!(key(&cold), key(&warm_projected));
+        for (c, w) in cold.hits.iter().zip(&warm_full.hits) {
+            assert_eq!(c.source["title"], w.source["title"]);
+            assert_eq!(w.source["blob"], json!(blob));
+        }
+    }
+
+    /// #2427: a query the segment FTS declines (here a `range` should-clause
+    /// on a field no document has; #2467 lets the FTS skip unmapped
+    /// term/phrase leaves, but not `range`/`exists`) walks every cold
+    /// segment through the brute stored scan. That scan decoded
+    /// every column — on a semantic_text corpus ~85% embedding companions —
+    /// although the page can only observe the `_source` includes plus the
+    /// fields the query reads. With an include list the cold decode must
+    /// read only those columns, answer exactly like the full decode, and
+    /// never publish the partial section to `decoded_stored_cache`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_stored_scan_with_source_includes_decodes_only_kept_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        engine
+            .create_index("scan-cold", topk_projection_schema())
+            .unwrap();
+        let idx = engine.get_index("scan-cold").unwrap();
+        idx.abort_background_tasks();
+        let vector: Vec<f64> = (0..64).map(|d| d as f64 * 0.015625).collect();
+        for i in 0..1500u64 {
+            let body = if i % 31 == 0 {
+                format!("needle report {i} needle")
+            } else {
+                format!("hay stack {i}")
+            };
+            idx.index_document(
+                Some(format!("doc-{i}")),
+                json!({
+                    "title": format!("title {i}"),
+                    "body": body,
+                    "blob": "padding ".repeat(64),
+                    "body_vector": vector,
+                    "body_vector_chunks": [{"text": body, "vector": vector}],
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        idx.flush().await.unwrap();
+        drop(idx);
+        drop(engine);
+
+        let reopen = || {
+            let mut c = Config::default();
+            c.server.data_dir = dir.path().to_string_lossy().into_owned();
+            let engine = crate::Engine::new(c).unwrap();
+            let idx = engine.get_index("scan-cold").unwrap();
+            idx.abort_background_tasks();
+            let held: Vec<String> = {
+                let snapshot = idx.store.snapshot();
+                snapshot.segments.iter().map(|s| s.id.to_string()).collect()
+            };
+            for id in &held {
+                idx.cold_stored_warms.insert(id.clone(), ());
+            }
+            (engine, idx, held)
+        };
+        let body = |source: Option<serde_json::Value>| {
+            let mut body = json!({
+                "query": {"bool": {
+                    "should": [
+                        {"match": {"body": "needle"}},
+                        {"range": {"defs": {"gte": "a"}}}
+                    ],
+                    "minimum_should_match": 1
+                }},
+                "size": 10
+            });
+            if let Some(source) = source {
+                body["_source"] = source;
+            }
+            xerj_query::parse_request(&body).unwrap()
+        };
+        let projected = body(Some(json!(["title"])));
+        let full = body(None);
+        assert!(fts_row_hydration_keep(&projected, &projected.query).is_some());
+
+        // Full-source query: the stored scan decodes and caches the section.
+        let (engine, idx, segs) = reopen();
+        let full_res = idx.search(&full).await.unwrap();
+        assert!(
+            segs.iter()
+                .any(|s| idx.decoded_stored_cache.contains_key(s)),
+            "precondition: this query shape takes the stored-scan path"
+        );
+        drop(idx);
+        drop(engine);
+
+        let (engine, idx, segs) = reopen();
+        let cold = idx.search(&projected).await.unwrap();
+        assert!(
+            segs.iter()
+                .all(|s| !idx.decoded_stored_cache.contains_key(s)
+                    && !idx.stored_slices_cache.contains_key(s)),
+            "a projected decode must never be cached as the full section"
+        );
+        let key = |r: &xerj_query::executor::SearchResult| {
+            r.hits
+                .iter()
+                .map(|h| (h.id.clone(), (h.score * 1e4).round() as i64))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(full_res.hits.len(), 10);
+        assert_eq!(key(&cold), key(&full_res));
+        assert_eq!(cold.total.value, full_res.total.value);
+        for (c, f) in cold.hits.iter().zip(&full_res.hits) {
+            assert_eq!(c.source, json!({"title": f.source["title"].clone()}));
+            assert!(f.source["body_vector"].is_array());
+        }
+
+        // The whole-document reader can still locate and restore every
+        // projected hit's full row.
+        let mut row_projected = HashMap::new();
+        let seg_of: HashMap<String, String> = cold
+            .hits
+            .iter()
+            .map(|h| (h.id.clone(), segs[0].clone()))
+            .collect();
+        if segs.len() == 1 {
+            idx.locate_scan_projected_rows(&cold.hits, &seg_of, &mut row_projected);
+            assert_eq!(row_projected.len(), cold.hits.len());
+            for h in &cold.hits {
+                let (seg, pos) = &row_projected[&h.id];
+                let mut rows = idx.hydrate_fts_rows_cold(seg, &[*pos], None).unwrap();
+                let doc = rows.remove(pos).unwrap();
+                assert_eq!(doc["_id"].as_str(), Some(h.id.as_str()));
+                assert!(doc["_source"]["body_vector_chunks"].is_array());
+            }
+        }
+        drop(idx);
+        drop(engine);
+    }
+
+    #[test]
+    fn row_projection_keep_set_covers_query_and_include_fields() {
+        let req = xerj_query::parse_request(&json!({
+            "query": {"bool": {
+                "must": [{"multi_match": {"query": "x", "fields": ["title^2", "body"]}}],
+                "filter": [{"term": {"kind": "a"}}]
+            }},
+            "_source": ["path"]
+        }))
+        .unwrap();
+        let keep = fts_row_hydration_keep(&req, &req.query).unwrap();
+        for f in ["body", "kind", "path", "title"] {
+            assert!(keep.iter().any(|k| k == f), "{f} missing from {keep:?}");
+        }
+        // A wildcard query field cannot be resolved to columns: no projection.
+        let wild = xerj_query::parse_request(&json!({
+            "query": {"multi_match": {"query": "x", "fields": ["*"]}},
+            "_source": ["path"]
+        }))
+        .unwrap();
+        assert!(fts_row_hydration_keep(&wild, &wild.query).is_none());
+        // `_savings` measures withheld bytes from the whole document.
+        let mut measured = req.clone();
+        measured.savings = xerj_query::ast::SavingsMode::Sampled;
+        assert!(fts_row_hydration_keep(&measured, &measured.query).is_none());
+        // No includes: the whole source is returned anyway.
+        let whole = xerj_query::parse_request(&json!({"query": {"match": {"body": "x"}}})).unwrap();
+        assert!(fts_row_hydration_keep(&whole, &whole.query).is_none());
+
+        let keep = vec!["meta".to_string(), "a.b".to_string(), "pre*".to_string()];
+        assert!(row_projection_keeps_column(&keep, "meta"));
+        assert!(row_projection_keeps_column(&keep, "meta.x"));
+        assert!(row_projection_keeps_column(&keep, "a"));
+        assert!(row_projection_keeps_column(&keep, "a.b"));
+        assert!(row_projection_keeps_column(&keep, "prefix"));
+        assert!(!row_projection_keeps_column(&keep, "metadata"));
+        assert!(!row_projection_keeps_column(&keep, "ab"));
     }
 
     /// #950: building the id→position map must NOT materialise the full
@@ -9798,6 +10442,15 @@ pub struct Index {
     /// decompress — one 30 ms decode became a ~1 s, 64-query stall
     /// episode at every flush/merge publish the warm hadn't reached yet.
     stored_slices_build_locks: Arc<dashmap::DashMap<String, Arc<std::sync::Mutex<()>>>>,
+    /// #2422/#2423: a weak handle to this index, so a query that answered a
+    /// cold segment from its winning rows alone can warm that segment's
+    /// stored slices off the query path (see `schedule_cold_stored_warm`).
+    self_ref: std::sync::OnceLock<std::sync::Weak<Index>>,
+    /// Segments with a background stored-slices warm queued or running.
+    cold_stored_warms: dashmap::DashMap<String, ()>,
+    /// Cold segments answered by row-selective hydration (observability and
+    /// tests).
+    cold_row_hydrations: AtomicU64,
     /// Per-(segment, field, bounds) Range pre-filter position sets.
     /// `build_range_prefilter_cached` was cached in name only — it re-ran
     /// the O(matches) `range_doc_ids` walk + HashSet build per query per
@@ -10491,7 +11144,11 @@ impl Index {
             merge_fts_reanalysed_docs: Arc::new(AtomicU64::new(0)),
             merge_batches_deferred: std::sync::atomic::AtomicBool::new(false),
             schema_persist_failures: AtomicU64::new(0),
+            self_ref: std::sync::OnceLock::new(),
+            cold_stored_warms: dashmap::DashMap::new(),
+            cold_row_hydrations: AtomicU64::new(0),
         });
+        let _ = index.self_ref.set(Arc::downgrade(&index));
         // #871 — event-driven merge scheduling: the store fires this hook on
         // every segment-set change (flush publication, merge application,
         // tombstone-only segment, orphan recovery) and the debounced check
@@ -10952,7 +11609,11 @@ impl Index {
             merge_fts_reanalysed_docs: Arc::new(AtomicU64::new(0)),
             merge_batches_deferred: std::sync::atomic::AtomicBool::new(false),
             schema_persist_failures: AtomicU64::new(0),
+            self_ref: std::sync::OnceLock::new(),
+            cold_stored_warms: dashmap::DashMap::new(),
+            cold_row_hydrations: AtomicU64::new(0),
         });
+        let _ = index.self_ref.set(Arc::downgrade(&index));
         // #871 — event-driven merge scheduling (see `Index::create` and
         // `request_merge_check`): wire the store's segments-changed hook.
         let merge_hook_index = Arc::downgrade(&index);
@@ -13329,7 +13990,21 @@ impl Index {
     /// 16 GiB host does not merge in smaller pieces. A 4 GiB budget
     /// (the AUTO cap on an 8 GiB host) is 64 MiB.
     /// `XERJ_MERGE_BATCH_MAX_INPUT_MB` overrides (0 disables the bound).
+    ///
+    /// #2427: a batch that had to yield under memory pressure narrows this
+    /// for every index through the governor's adaptive cap
+    /// (`merge_budget::effective_batch_cap_bytes`).
     fn merge_batch_cap_bytes() -> u64 {
+        let pressure_cap = crate::governor::global()
+            .map(|governor| governor.merge_pressure_cap_bytes())
+            .unwrap_or(0);
+        crate::merge_budget::effective_batch_cap_bytes(
+            Self::merge_static_batch_cap_bytes(),
+            pressure_cap,
+        )
+    }
+
+    fn merge_static_batch_cap_bytes() -> u64 {
         const MB: u64 = 1024 * 1024;
         if let Ok(raw) = std::env::var("XERJ_MERGE_BATCH_MAX_INPUT_MB") {
             if let Ok(mb) = raw.trim().parse::<u64>() {
@@ -13416,24 +14091,33 @@ impl Index {
                 let sizes: Vec<u64> = segs.iter().map(|s| s.size_bytes).collect();
                 let ids: Vec<SegmentId> = segs.into_iter().map(|s| s.id.clone()).collect();
                 let chunk_len = (mc.max_merge_count as usize).max(2);
-                let mut chunks: Vec<Vec<SegmentId>> = Vec::new();
-                let mut batch: Vec<SegmentId> = Vec::new();
-                let mut batch_bytes = 0u64;
-                for (id, size) in ids.into_iter().zip(sizes) {
-                    if !batch.is_empty()
-                        && (batch.len() >= chunk_len || (cap > 0 && batch_bytes + size > cap))
-                    {
-                        chunks.push(std::mem::take(&mut batch));
-                        batch_bytes = 0;
-                    }
-                    batch_bytes = batch_bytes.saturating_add(size);
-                    batch.push(id);
-                }
-                if !batch.is_empty() {
-                    chunks.push(batch);
-                }
-                chunks.retain(|c| c.len() >= 2);
-                chunks
+                forcemerge_chunks(&sizes, chunk_len, cap)
+                    .into_iter()
+                    .map(|chunk| chunk.into_iter().map(|i| ids[i].clone()).collect())
+                    .collect()
+            }
+            // #1122/#2433: at the target count, a forcemerge under
+            // XERJ_STORE_SEMANTIC_VECTORS still rewrites each segment that
+            // holds rows stored without their derived semantic vectors, so
+            // the documented pre-downgrade `_forcemerge` restores them on an
+            // index that is already one segment.
+            Some(_) if xerj_storage::stored_codec::derived_vectors::store_vectors_opt_out() => {
+                let segments_dir = self.data_dir.join("segments");
+                segments_snapshot_init
+                    .iter()
+                    .filter(|meta| {
+                        let Ok(reader) = SegmentReader::open(segments_dir.join(&meta.seg_path))
+                        else {
+                            return false;
+                        };
+                        matches!(
+                            reader.section(SectionType::Stored),
+                            Ok(Some(raw)) if xerj_storage::stored_codec::stored_has_derived_rows(raw)
+                                .unwrap_or(false)
+                        )
+                    })
+                    .map(|meta| vec![meta.id.clone()])
+                    .collect()
             }
             Some(_) => Vec::new(),
             None => policy.select_merges(&segments_snapshot_init),
@@ -13632,9 +14316,40 @@ impl Index {
         // pass returns an ERROR so callers (forcemerge HTTP → 500, background
         // task → error log) hear about it loudly instead of losing data.
         let failed_batches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // #2427 — background batches that stopped because the breaker was
+        // engaged with RSS at the process limit. Not a failure: inputs stay,
+        // the pass is flagged deferred, and the governor narrows the next
+        // batches (`merge_budget::merge_must_yield`).
+        let yielded_batches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // #2427 — process-wide admission. Every launch reserves the batch's
+        // estimated working set against the RSS watermark through the
+        // governor's merge ledger, so concurrent merges across indices see
+        // each other before they allocate, and background merges wait while
+        // the breaker is engaged. `None` = defer; `Some(None)` = no governor.
+        let forced_merge = force_max_segments.is_some();
+        let admit_merge = |metas: &[xerj_storage::segment::SegmentMeta]|
+         -> Option<Option<crate::governor::MergeReservation>> {
+            let Some(governor) = crate::governor::global() else {
+                return Some(None);
+            };
+            let input: u64 = metas.iter().map(|meta| meta.size_bytes).sum();
+            // #2427: reserve on the inputs' whole footprint. `size_bytes` is
+            // the segment file alone; the side-cars the merge decodes are
+            // usually several times larger (see
+            // `merge_budget::MERGE_ON_DISK_WORKING_SET_NUMERATOR`).
+            let ids: Vec<xerj_storage::segment::SegmentId> =
+                metas.iter().map(|meta| meta.id.clone()).collect();
+            let on_disk = self.store.segment_files_bytes(&ids);
+            governor
+                .try_reserve_merge_with_footprint(input, on_disk, forced_merge)
+                .map(Some)
+        };
+        let mut governor_deferred = 0usize;
 
         let spawn_one = |batch: Vec<xerj_storage::segment::SegmentId>,
-                         metas: Vec<xerj_storage::segment::SegmentMeta>|
+                         metas: Vec<xerj_storage::segment::SegmentMeta>,
+                         reservation: Option<crate::governor::MergeReservation>|
          -> JoinHandle<Option<MergeOutput>> {
             let store_for_task = Arc::clone(&self.store);
             let registry_for_task = Arc::clone(&self.registry);
@@ -13654,9 +14369,80 @@ impl Index {
             // is precisely why raising the effort here is safe and raising it
             // on flush was not.
             let merge_zstd_level = self.compression_config.level.zstd_level();
+            // Ingest-regression fix: only an explicit `_forcemerge` (or the
+            // `XERJ_MERGE_MAX_EFFORT` opt-in) pays for the level-19 stored
+            // chooser. A background merge holds RSS at the breaker
+            // watermark for as long as it runs, so its encode speed is
+            // ingest throughput.
+            let long_effort_merge = merge_uses_long_effort_stored_encode(
+                force_max_segments.is_some(),
+                std::env::var("XERJ_MERGE_MAX_EFFORT").ok().as_deref(),
+            );
             let batch_for_task = batch;
             let metas_for_task = metas;
             let failed_for_task = Arc::clone(&failed_batches);
+            let yielded_for_task = Arc::clone(&yielded_batches);
+            let forced_for_task = force_max_segments.is_some();
+            let input_bytes_for_task: u64 = metas_for_task.iter().map(|meta| meta.size_bytes).sum();
+            // Checked at each input segment, every 8192 surviving docs, and
+            // before the output segment is created — never after, so a
+            // yielded batch leaves no partial output behind.
+            let must_yield = move || -> bool {
+                let Some(governor) = crate::governor::global() else {
+                    return false;
+                };
+                if !governor.merge_must_yield_for(forced_for_task, input_bytes_for_task) {
+                    return false;
+                }
+                let cap = governor.note_merge_yield(input_bytes_for_task);
+                tracing::warn!(
+                    input_mb = input_bytes_for_task / (1024 * 1024),
+                    rss_mb = governor.observed_rss_bytes() / (1024 * 1024),
+                    limit_mb = governor.process_memory_limit_bytes() / (1024 * 1024),
+                    next_batch_cap_mb = cap / (1024 * 1024),
+                    "merge batch yielded: memory pressure with RSS at the merge-pool ceiling; \
+                     inputs kept, later batches narrowed"
+                );
+                true
+            };
+            // #2427 — the output-write step (doc-values build, stored
+            // encode, FTS side-car build) runs after the last `must_yield`
+            // checkpoint and is the batch's peak: large pg-docs merges took a
+            // 3,072 MB search node to 4.4–4.9 GB there, about 5 s before they
+            // completed. It is charged to the batch's merge reservation before
+            // it starts, and refused (the batch yields, inputs kept, later
+            // batches narrowed) when it would take RSS to the hard limit. See
+            // `ResourceGovernor::admit_merge_write`.
+            let admit_write = move |reservation: Option<&mut crate::governor::MergeReservation>,
+                                    held: u64,
+                                    extra: u64|
+                  -> bool {
+                let Some(governor) = crate::governor::global() else {
+                    return true;
+                };
+                // #2468 lets a small background batch run to completion
+                // after a streak of yields with nothing merged. When that
+                // rule is what waived this batch's yield, the write runs
+                // too, or refusing it would bring the stall back.
+                let exempt = governor.merge_write_exempt(forced_for_task, input_bytes_for_task);
+                if governor.admit_merge_write(reservation, held, extra, forced_for_task, exempt) {
+                    return true;
+                }
+                let cap = governor.note_merge_yield(input_bytes_for_task);
+                tracing::warn!(
+                    input_mb = input_bytes_for_task / (1024 * 1024),
+                    write_mb = extra / (1024 * 1024),
+                    rss_mb = governor.observed_rss_bytes() / (1024 * 1024),
+                    limit_mb = governor.process_memory_limit_bytes() / (1024 * 1024),
+                    next_batch_cap_mb = cap / (1024 * 1024),
+                    "merge batch yielded before its output write: the write would take RSS \
+                     to the process limit; inputs kept, later batches narrowed"
+                );
+                false
+            };
+            // Held by the encode job until it ends, so the write step can
+            // grow it (see `admit_write`).
+            let mut reservation_for_encode = reservation;
             #[cfg(test)]
             let hold_merge_encode = Arc::clone(&self.test_hold_merge_encode);
             #[cfg(test)]
@@ -13760,14 +14546,19 @@ impl Index {
                     // remapped, not re-derived). `retained_bytes` charges only
                     // what the reader OWNS (an mmap'd `.post` contributes 0),
                     // matching what this batch adds to the heap.
-                    let merge_reader_retained = merge_readers.as_ref().map(|readers| {
-                        let bytes: u64 = readers
-                            .iter()
-                            .map(|reader| reader.retained_bytes())
-                            .sum();
+                    let merge_reader_bytes: u64 = merge_readers
+                        .as_ref()
+                        .map(|readers| {
+                            readers
+                                .iter()
+                                .map(|reader| reader.retained_bytes())
+                                .sum::<u64>()
+                        })
+                        .unwrap_or(0);
+                    let merge_reader_retained = merge_readers.as_ref().map(|_| {
                         crate::ingest_memory::Retained::new(
                             crate::ingest_memory::Category::MergeDecoded,
-                            bytes as usize,
+                            merge_reader_bytes as usize,
                         )
                     });
 
@@ -13820,10 +14611,20 @@ impl Index {
                     // for the doc-values pass.  Drops `dv_sources` entirely.
                     // Halves merge working memory and frees the Arc<Value>
                     // immediately after both passes complete.
+                    // #2427: the third slot used to carry each surviving
+                    // document's whole `_source` `Value` tree for the
+                    // doc-values pass, held from the drain loop through the
+                    // stored encode (which parses the same batch into a
+                    // second `Vec<Value>` of its own), the FTS build and the
+                    // doc-values build. Two full Value trees of the batch
+                    // were live at once after the last yield point. The
+                    // doc-values columns are now built from `merged_json_buf`
+                    // one document at a time (`merge_doc_value_sources`), so
+                    // the slot is empty.
                     let mut fts_input: Vec<(
                         String,
                         HashMap<String, xerj_fts::index::FieldValues>,
-                        Value,
+                        (),
                     )> = Vec::new();
                     // (seq_no, doc_id) for every surviving doc — kept exactly
                     // aligned with the stored-section byte copy (pushed right
@@ -13874,6 +14675,10 @@ impl Index {
                     let mut tomb_union: HashMap<String, u64> = HashMap::new();
 
                     for (source_index, meta) in metas_for_task.iter().enumerate() {
+                        if must_yield() {
+                            yielded_for_task.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
                         min_seq = min_seq.min(meta.min_seq_no);
                         max_seq = max_seq.max(meta.max_seq_no);
                         let seg_path = segments_dir_for_task.join(&meta.seg_path);
@@ -13974,7 +14779,13 @@ impl Index {
                             }
                         };
                         let stored_bytes =
-                            match xerj_storage::stored_codec::decode_stored(stored_bytes_raw) {
+                            // #1122/#2433: keep stripped semantic vectors
+                                // stripped (the merged encode would only
+                                // re-derive and drop them again), unless
+                                // XERJ_STORE_SEMANTIC_VECTORS restores them.
+                            match xerj_storage::stored_codec::decode_stored_for_rewrite(
+                                stored_bytes_raw,
+                            ) {
                                 Ok(b) => b,
                                 Err(e) => {
                                     tracing::error!(
@@ -14039,6 +14850,19 @@ impl Index {
                         ordinals.resize(raw_docs.len(), None);
                         doc_maps[source_index] = ordinals;
                         for (source_ordinal, raw) in raw_docs.iter().enumerate() {
+                            // #2427 — the survivor scan copies each input's
+                            // live docs, so a batch can grow hundreds of MB
+                            // inside one input. Check the governor every
+                            // `MERGE_YIELD_CHECKPOINT_DOCS` docs, not only
+                            // between inputs.
+                            if source_ordinal > 0
+                                && (source_ordinal as u64)
+                                    .is_multiple_of(crate::merge_budget::MERGE_YIELD_CHECKPOINT_DOCS)
+                                && must_yield()
+                            {
+                                yielded_for_task.fetch_add(1, Ordering::Relaxed);
+                                return None;
+                            }
                             let raw_str = raw.get();
                             let id_seq: IdSeq = match serde_json::from_str(raw_str) {
                                 Ok(v) => v,
@@ -14155,40 +14979,38 @@ impl Index {
                         // addresses a document by. An empty `_source` indexes and
                         // columnises nothing for it, which is the same as the
                         // skip minus the shift.
-                        let doc_value: Value =
-                            serde_json::from_str(&raw_str).unwrap_or_else(|error| {
-                                tracing::warn!(
-                                    doc = %id_str,
-                                    "merge: surviving doc failed its re-parse, indexing it empty: {error}"
-                                );
-                                Value::Null
-                            });
-                        let source = doc_value.get("_source").cloned().unwrap_or(Value::Null);
                         // The merged FTS/doc-values ordinal is this document's
                         // index in `fts_input`.
                         doc_maps[source_index as usize][source_ordinal as usize] =
                             Some(fts_input.len() as u32);
                         // The re-analysis input. `merge_postings` replays the
                         // inputs' posting lists instead, so it needs no field
-                        // values at all — only the `_source` the doc-values
-                        // builder reads below. An empty `HashMap` allocates
-                        // nothing.
+                        // values and no per-document parse at all (#2427: the
+                        // doc-values pass re-reads `merged_json_buf`). An
+                        // empty `HashMap` allocates nothing. The `Value` the
+                        // rebuild parses drops at the end of this iteration.
                         let fields = if merge_postings {
                             HashMap::new()
                         } else {
-                            extract_fts_fields_excluding(&source, &excluded_fts_fields_for_task)
+                            let doc_value: Value =
+                                serde_json::from_str(&raw_str).unwrap_or_else(|error| {
+                                    tracing::warn!(
+                                        doc = %id_str,
+                                        "merge: surviving doc failed its re-parse, indexing it empty: {error}"
+                                    );
+                                    Value::Null
+                                });
+                            let source = doc_value.get("_source").unwrap_or(&Value::Null);
+                            // #948 attribution: the transient parse, per doc,
+                            // only when tracing is enabled.
+                            if crate::ingest_memory::enabled() {
+                                fts_input_bytes = fts_input_bytes
+                                    .saturating_add(crate::ingest_memory::estimated_json_heap(source));
+                            }
+                            extract_fts_fields_excluding(source, &excluded_fts_fields_for_task)
                         };
-                        // #948 attribution: the Value tree the FTS/DV passes
-                        // hold until the end of the batch. The walk is
-                        // per-document but only when tracing is enabled.
-                        if crate::ingest_memory::enabled() {
-                            fts_input_bytes = fts_input_bytes
-                                .saturating_add(crate::ingest_memory::estimated_json_heap(
-                                    doc_value.get("_source").unwrap_or(&Value::Null),
-                                ));
-                        }
                         if let Err(error) =
-                            crate::merge_reserve::try_push_merge(&mut fts_input, (id_str, fields, source))
+                            crate::merge_reserve::try_push_merge(&mut fts_input, (id_str, fields, ()))
                         {
                             tracing::error!("{error}");
                             failed_for_task.fetch_add(1, Ordering::Relaxed);
@@ -14199,6 +15021,17 @@ impl Index {
                         // `fts_input` grow, so the crossover IS the batch's
                         // stored-side peak.
                         drain_checkpoint += 1;
+                        // #2427 — the yield check runs every
+                        // `MERGE_YIELD_CHECKPOINT_DOCS` docs. At 8192 a pg-docs
+                        // batch on the 1 GB gate grew RSS 300+ MB past the
+                        // watermark between two checks.
+                        if drain_checkpoint
+                            .is_multiple_of(crate::merge_budget::MERGE_YIELD_CHECKPOINT_DOCS)
+                            && must_yield()
+                        {
+                            yielded_for_task.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
                         if drain_checkpoint.is_multiple_of(8192) {
                             crate::ingest_memory::observe_checkpoint(
                                 crate::ingest_memory::Category::MergeJsonBuffer,
@@ -14235,6 +15068,53 @@ impl Index {
                         fts_input_bytes,
                     );
 
+                    if must_yield() {
+                        yielded_for_task.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                    // #2427 — last chance to stop: everything below allocates
+                    // on top of what the batch holds now and cannot yield.
+                    // Charge it to the merge budget first, or yield.
+                    {
+                        let json_bytes = merged_json_buf.len() as u64;
+                        let fts_bytes = fts_input_bytes as u64;
+                        let write_fts_bytes = if merge_postings {
+                            merge_reader_bytes
+                        } else {
+                            fts_bytes
+                        };
+                        let held = json_bytes
+                            .saturating_add(fts_bytes)
+                            .saturating_add(merge_reader_bytes);
+                        let extra = crate::merge_budget::merge_write_phase_bytes(
+                            json_bytes,
+                            write_fts_bytes,
+                        );
+                        if !admit_write(reservation_for_encode.as_mut(), held, extra) {
+                            yielded_for_task.fetch_add(1, Ordering::Relaxed);
+                            return None;
+                        }
+                    }
+                    // Doc-values columns, built here from the merged stored
+                    // JSON one document at a time (#2427) and written once the
+                    // merged segment id exists, below. The columns are what
+                    // survives; the per-document `_source` trees do not.
+                    // Before, those trees were held in `fts_input` for the
+                    // whole batch, through the stored encode that parses the
+                    // same documents into a second `Vec<Value>`: two decoded
+                    // copies of the batch at once, past the last yield point.
+                    let dv_timer = std::time::Instant::now();
+                    let dv_columns = match merge_doc_value_sources(&merged_json_buf) {
+                        Ok(sources) => Some(build_doc_value_columns(sources, &dv_skip_for_merge)),
+                        Err(e) => {
+                            tracing::warn!(
+                                "merge: merged stored JSON did not re-parse for doc-values, \
+                                 segment ships no doc-values side-car: {e}"
+                            );
+                            None
+                        }
+                    };
+                    let dv_build_us = dv_timer.elapsed().as_micros();
                     // Write merged stored section using the columnar v2 codec.
                     let mut writer = match SegmentWriter::new(&segments_dir_for_task, 1, 0, 0) {
                         Ok(w) => w,
@@ -14246,11 +15126,19 @@ impl Index {
                     };
                     let stored_timer = std::time::Instant::now();
                     // The merge entry also runs the per-column long-effort
-                    // zstd chooser (#1038) — background-only by contract.
-                    let encoded = xerj_storage::stored_codec::encode_stored_v2_merge_at_level(
-                        &merged_json_buf,
-                        merge_zstd_level,
-                    );
+                    // zstd chooser (#1038) only on an explicit `_forcemerge`
+                    // or the opt-in; background merges use the plain level.
+                    let encoded = if long_effort_merge {
+                        xerj_storage::stored_codec::encode_stored_v2_forcemerge_at_level(
+                            &merged_json_buf,
+                            merge_zstd_level,
+                        )
+                    } else {
+                        xerj_storage::stored_codec::encode_stored_v2_merge_at_level(
+                            &merged_json_buf,
+                            merge_zstd_level,
+                        )
+                    };
                     // #948 attribution: the compressed output buffer is an
                     // exact owned length; it coexists with the drained buffer
                     // for one encode call.
@@ -14478,14 +15366,10 @@ impl Index {
                     version_repoint_intents
                         .extend(tomb_carry.iter().map(|(seq, id)| (*seq, id.clone(), true)));
 
-                    // Doc-values side-car — reuse the same `Value`s we
-                    // stashed in fts_input above (M5.22).
+                    // Doc-values side-car — the columns were built before the
+                    // stored encode (#2427, see `dv_columns`).
                     let dv_timer = std::time::Instant::now();
-                    {
-                        let columns = build_doc_value_columns(
-                            fts_input.iter().map(|(_, _, v)| Some(v)),
-                            &dv_skip_for_merge,
-                        );
+                    if let Some(columns) = dv_columns {
                         if !columns.is_empty() {
                             if let Err(e) = write_doc_values_sidecar_at_level(
                                 &segments_dir_for_task,
@@ -14498,10 +15382,11 @@ impl Index {
                         }
                     }
 
-                    let dv_us = dv_timer.elapsed().as_micros();
-                    // `fts_input` (raw ids + the per-doc `_source` Value
-                    // trees) survives its last reader here — the batch's
-                    // parsed-side attribution ends with it.
+                    let dv_us = dv_build_us + dv_timer.elapsed().as_micros();
+                    // `fts_input` (raw ids + the re-analysis field values;
+                    // no `_source` trees since #2427) survives its last
+                    // reader here — the batch's parsed-side attribution ends
+                    // with it.
                     crate::ingest_memory::observe_checkpoint(
                         crate::ingest_memory::Category::MergeParsed,
                         0,
@@ -14523,11 +15408,21 @@ impl Index {
                         version_repoint_intents,
                     ))
                 }));
+                // Held until the encode (the allocation-heavy part: stored
+                // decode, FST and doc-values build) has finished.
+                drop(reservation_for_encode);
                 let _ = encode_tx.send(encoded);
             });
             tokio::spawn(async move {
                 match encode_rx.await {
-                    Ok(Ok(value)) => value,
+                    Ok(Ok(value)) => {
+                        if value.is_some() && !forced_for_task {
+                            if let Some(governor) = crate::governor::global() {
+                                governor.note_merge_completed(input_bytes_for_task);
+                            }
+                        }
+                        value
+                    }
                     Ok(Err(payload)) => std::panic::resume_unwind(payload),
                     // The encode task vanished without a result. Panic so the
                     // driver counts a failed batch (the `JoinError` arm)
@@ -14538,15 +15433,33 @@ impl Index {
             })
         };
 
+        // Launch the pending batch if the governor admits it (#2427). A
+        // refusal leaves it and every later batch of this pass unmerged and
+        // flags the pass deferred, so the scheduler retries after the drain.
+        macro_rules! launch_next {
+            () => {
+                match pending.take() {
+                    Some((batch, metas)) => match admit_merge(&metas) {
+                        Some(reservation) => {
+                            in_flight.push(spawn_one(batch, metas, reservation));
+                            pending = queue_iter.next();
+                            true
+                        }
+                        None => {
+                            governor_deferred += 1 + queue_iter.by_ref().count();
+                            false
+                        }
+                    },
+                    None => false,
+                }
+            };
+        }
+
         // Fill in_flight up to the cap, then drain one-by-one as they
         // complete, launching replacements from `queue_iter`.
         while in_flight.len() < merge_parallelism {
-            match pending.take() {
-                Some((batch, metas)) => {
-                    in_flight.push(spawn_one(batch, metas));
-                    pending = queue_iter.next();
-                }
-                None => break,
+            if !launch_next!() {
+                break;
             }
         }
         while !in_flight.is_empty() {
@@ -14753,10 +15666,7 @@ impl Index {
                         // `continue` bypasses the common top-up below. Launch
                         // the next disjoint batch first so one failed apply
                         // does not silently suppress the rest of this pass.
-                        if let Some((batch, metas)) = pending.take() {
-                            in_flight.push(spawn_one(batch, metas));
-                            pending = queue_iter.next();
-                        }
+                        launch_next!();
                         continue;
                     }
                     // `apply_merge` has made the output authoritative. No
@@ -14818,10 +15728,7 @@ impl Index {
                             // Same pipeline rule as the failed-apply path: the
                             // `continue` below bypasses the loop's bottom
                             // top-up, so launch the next disjoint batch here.
-                            if let Some((batch, metas)) = pending.take() {
-                                in_flight.push(spawn_one(batch, metas));
-                                pending = queue_iter.next();
-                            }
+                            launch_next!();
                             continue;
                         }
                         // Disk-space fix (2026-07): the input segments are
@@ -14887,9 +15794,32 @@ impl Index {
                 }
             }
             // Top up in_flight.
-            if let Some((batch, metas)) = pending.take() {
-                in_flight.push(spawn_one(batch, metas));
-                pending = queue_iter.next();
+            launch_next!();
+        }
+        let yielded = yielded_batches.load(AtomicOrdering::Relaxed);
+        if yielded > 0 {
+            self.merge_batches_deferred
+                .store(true, AtomicOrdering::Relaxed);
+            tracing::info!(
+                index = %self.name,
+                yielded,
+                "merge batches yielded under memory pressure; inputs kept"
+            );
+        }
+        if governor_deferred > 0 {
+            self.merge_batches_deferred
+                .store(true, AtomicOrdering::Relaxed);
+            if let Some(governor) = crate::governor::global() {
+                tracing::info!(
+                    index = %self.name,
+                    deferred = governor_deferred,
+                    rss_mb = governor.observed_rss_bytes() / (1024 * 1024),
+                    watermark_mb = governor.memory_watermark_bytes() / (1024 * 1024),
+                    merge_reserved_mb = governor.merge_reserved_bytes() / (1024 * 1024),
+                    merges_in_flight = governor.merges_in_flight(),
+                    breaker_engaged = governor.memory_breaker_engaged(),
+                    "merge batches deferred by the memory governor; inputs kept"
+                );
             }
         }
 
@@ -17017,6 +17947,281 @@ impl Index {
                 .collect()
         })
         .await
+    }
+
+    /// #2422/#2423: `{"_id", "_source"}` docs for the scored FTS walk of a
+    /// segment whose stored offset index is NOT resident, decoded
+    /// row-selectively for `positions` only — and, when `keep` names the
+    /// source fields the request can observe, only those columns.
+    ///
+    /// The legacy cold path (`stored_slices_for`) decompressed and
+    /// brace-walked the WHOLE stored section to read the top-k: a size-45
+    /// query on a 30k-doc autoindex segment spent ~3 s there, and on a
+    /// flight-trace index whose rows carry a ~72 KB `trace` field, 650 ms for
+    /// five hits. Segments are immutable, so a row decode of the same
+    /// positions yields the same document; `None` (legacy LZ4 layout,
+    /// unsupported column shape, open/decode error, a missing row) sends the
+    /// caller back to the full decode, so nothing is lost.
+    /// Warm a segment's full stored slices on the blocking pool after a query
+    /// answered it from its winning rows (#2422/#2423). Later queries with
+    /// other winners then read the warm cache instead of each paying a
+    /// projected decode, and the query that found the segment cold no longer
+    /// waits for the whole-section decompress. One warm per segment at a
+    /// time; `stored_slices_for` keeps its single-flight, budget and
+    /// retirement rules.
+    fn schedule_cold_stored_warm(&self, segment_id: &str, doc_count: u64) {
+        let Some(index) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if crate::governor::global().is_some_and(|g| g.memory_breaker_engaged()) {
+            return;
+        }
+        if self
+            .cold_stored_warms
+            .insert(segment_id.to_string(), ())
+            .is_some()
+        {
+            return;
+        }
+        let segment_id = segment_id.to_string();
+        runtime.spawn_blocking(move || {
+            if !index.stored_slices_cache.contains_key(segment_id.as_str()) {
+                let _ = index.stored_slices_for(&segment_id, doc_count);
+            }
+            index.cold_stored_warms.remove(segment_id.as_str());
+        });
+    }
+
+    /// #2427: find the row of every `hits` entry whose `_source` came from a
+    /// column-projected stored scan (`scan_projected`: id → segment) and
+    /// record it in `row_projected`, so the whole-document reader (TF-IDF
+    /// fallback) can restore the full source. Decodes only the identity
+    /// columns of each segment involved; rare path.
+    fn locate_scan_projected_rows(
+        &self,
+        hits: &[Hit],
+        scan_projected: &HashMap<String, String>,
+        row_projected: &mut HashMap<String, (String, u32)>,
+    ) {
+        let mut wanted: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for hit in hits {
+            if let Some(segment) = scan_projected.get(&hit.id) {
+                wanted
+                    .entry(segment.as_str())
+                    .or_default()
+                    .insert(hit.id.as_str());
+            }
+        }
+        for (segment, ids) in wanted {
+            let Some(reader) = self.store.open_segment_arc(segment).ok() else {
+                continue;
+            };
+            let Some(bytes) = reader.section(SectionType::Stored).ok().flatten() else {
+                continue;
+            };
+            let Some(identity) =
+                xerj_storage::stored_codec::decode_stored_keeping(bytes, &|_: &str| false)
+                    .ok()
+                    .flatten()
+            else {
+                continue;
+            };
+            let Ok(rows) = serde_json::from_slice::<Vec<Value>>(&identity) else {
+                continue;
+            };
+            for (position, row) in rows.iter().enumerate() {
+                let Some(id) = row.get("_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if ids.contains(id) {
+                    if let Ok(position) = u32::try_from(position) {
+                        row_projected.insert(id.to_string(), (segment.to_string(), position));
+                    }
+                }
+            }
+        }
+    }
+
+    fn hydrate_fts_rows_cold(
+        &self,
+        segment_id: &str,
+        positions: &[u32],
+        keep: Option<&[String]>,
+    ) -> Option<HashMap<u32, Value>> {
+        use xerj_storage::stored_codec::{
+            decode_stored_v2_rows_projected_parallel, stored_v2_source_column_names,
+            StoredV2RowHydrationResult,
+        };
+        let reader = self.store.open_segment_arc(segment_id).ok()?;
+        let bytes = reader.section(SectionType::Stored).ok()??;
+        let ordinals: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
+        // Columns decode concurrently: a handful of rows still streams every
+        // wanted column, so the serial sum was the cost of a cold page.
+        let hydrated = match keep {
+            Some(keep) => {
+                let names = stored_v2_source_column_names(bytes).ok()??;
+                let include: Vec<&str> = names
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|column| row_projection_keeps_column(keep, column))
+                    .collect();
+                decode_stored_v2_rows_projected_parallel(bytes, &ordinals, Some(&include)).ok()?
+            }
+            None => decode_stored_v2_rows_projected_parallel(bytes, &ordinals, None).ok()?,
+        };
+        let StoredV2RowHydrationResult::Hydrated { rows, .. } = hydrated else {
+            return None;
+        };
+        let mut out: HashMap<u32, Value> = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let id = row.id.as_str()?.to_string();
+            let mut doc = serde_json::Map::with_capacity(2);
+            doc.insert("_id".to_string(), Value::String(id));
+            doc.insert("_source".to_string(), Value::Object(row.source));
+            out.insert(u32::try_from(row.ordinal).ok()?, Value::Object(doc));
+        }
+        // Every requested position must come back; a short answer means the
+        // section and the FTS doc ids disagree, which the full decode path
+        // already knows how to handle.
+        if positions.iter().any(|p| !out.contains_key(p)) {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// `_id` per row for `positions` of a cold segment, decoded from the
+    /// identity columns alone (no `_source` column is read). `None` (legacy
+    /// layout, open/decode error, a missing row) sends the caller back to
+    /// the full decode.
+    fn cold_fts_row_ids(
+        &self,
+        segment_id: &str,
+        positions: &[u32],
+    ) -> Option<HashMap<u32, String>> {
+        use xerj_storage::stored_codec::{
+            decode_stored_v2_rows_projected, StoredV2RowHydrationResult,
+        };
+        let reader = self.store.open_segment_arc(segment_id).ok()?;
+        let bytes = reader.section(SectionType::Stored).ok()??;
+        let ordinals: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
+        let StoredV2RowHydrationResult::Hydrated { rows, .. } =
+            decode_stored_v2_rows_projected(bytes, &ordinals, &[]).ok()?
+        else {
+            return None;
+        };
+        let mut out: HashMap<u32, String> = HashMap::with_capacity(rows.len());
+        for row in rows {
+            out.insert(
+                u32::try_from(row.ordinal).ok()?,
+                row.id.as_str()?.to_string(),
+            );
+        }
+        if positions.iter().any(|p| !out.contains_key(p)) {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// Fill the `_source` of the cold FTS hits the segment loop kept with
+    /// identity only (`deferred`: `_id` -> (segment, row, doc count)). Only
+    /// the page's winners are read, row-selectively and per segment in
+    /// parallel. A segment whose rows cannot be hydrated that way falls back
+    /// to the full decode, as the walk itself used to; a hit whose document
+    /// cannot be read at all is dropped, as the walk skipped an unreadable
+    /// row. Projected hits are recorded in `row_projected` so the TF-IDF
+    /// fallback can restore their whole source.
+    fn hydrate_deferred_cold_sources(
+        &self,
+        hits: Vec<Hit>,
+        deferred: &HashMap<String, (String, u32, u64)>,
+        keep: Option<&[String]>,
+        row_projected: &mut HashMap<String, (String, u32)>,
+    ) -> Vec<Hit> {
+        use rayon::prelude::*;
+        let mut by_segment: HashMap<&str, (Vec<u32>, u64)> = HashMap::new();
+        for hit in &hits {
+            if let Some((seg, pos, doc_count)) = deferred.get(&hit.id) {
+                by_segment
+                    .entry(seg.as_str())
+                    .or_insert_with(|| (Vec::new(), *doc_count))
+                    .0
+                    .push(*pos);
+            }
+        }
+        if by_segment.is_empty() {
+            return hits;
+        }
+        let segments: Vec<(&str, Vec<u32>, u64)> = by_segment
+            .into_iter()
+            .map(|(seg, (positions, doc_count))| (seg, positions, doc_count))
+            .collect();
+        // (segment, docs by row, projected?)
+        let loaded: Vec<(&str, HashMap<u32, Value>, bool)> = segments
+            .par_iter()
+            .map(|(seg, positions, doc_count)| {
+                if let Some(rows) = self.hydrate_fts_rows_cold(seg, positions, keep) {
+                    return (*seg, rows, keep.is_some());
+                }
+                let mut docs: HashMap<u32, Value> = HashMap::with_capacity(positions.len());
+                if let Some(slices) = self.stored_slices_for(seg, *doc_count) {
+                    for &pos in positions {
+                        let doc = slices
+                            .offsets
+                            .get(pos as usize)
+                            .and_then(|&(start, end)| {
+                                slices.bytes.get(start as usize..end as usize)
+                            })
+                            .and_then(|slice| serde_json::from_slice::<Value>(slice).ok());
+                        if let Some(doc) = doc {
+                            docs.insert(pos, doc);
+                        }
+                    }
+                } else if let Some(all) = self.store.open_segment_arc(seg).ok().and_then(|reader| {
+                    match reader.section(SectionType::Stored) {
+                        Ok(Some(raw)) => xerj_storage::stored_codec::decode_stored(raw)
+                            .ok()
+                            .and_then(|b| serde_json::from_slice::<Vec<Value>>(&b).ok()),
+                        _ => None,
+                    }
+                }) {
+                    for &pos in positions {
+                        if let Some(doc) = all.get(pos as usize) {
+                            docs.insert(pos, doc.clone());
+                        }
+                    }
+                }
+                (*seg, docs, false)
+            })
+            .collect();
+        let mut docs_by_segment: HashMap<&str, (HashMap<u32, Value>, bool)> = loaded
+            .into_iter()
+            .map(|(seg, docs, projected)| (seg, (docs, projected)))
+            .collect();
+        let mut out = Vec::with_capacity(hits.len());
+        for mut hit in hits {
+            let Some((seg, pos, _)) = deferred.get(&hit.id) else {
+                out.push(hit);
+                continue;
+            };
+            let Some((docs, projected)) = docs_by_segment.get_mut(seg.as_str()) else {
+                continue;
+            };
+            let Some(mut doc) = docs.remove(pos) else {
+                continue;
+            };
+            hit.source = doc
+                .get_mut("_source")
+                .map(Value::take)
+                .unwrap_or(Value::Null);
+            if *projected {
+                row_projected.insert(hit.id.clone(), (seg.clone(), *pos));
+            }
+            out.push(hit);
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -23758,6 +24963,19 @@ impl Index {
         // different `_id`s and different `_score`s.  The merge now selects the
         // global top-k by score (see the FTS admission below), so the cap
         // controls only how much work is done, never which hits win.
+        // #2422/#2423 — the source columns a cold scored FTS page needs.
+        let fts_row_keep: Option<Vec<String>> = fts_row_hydration_keep(request, query);
+        // Hits whose `_source` came back column-projected, by id → (segment,
+        // position), so the one post-page reader that looks at the WHOLE
+        // document (the TF-IDF fallback below) can restore it.
+        let mut row_projected: HashMap<String, (String, u32)> = HashMap::new();
+        // #2427: stored-scan hits whose `_source` came from a column-projected
+        // cold decode, by id → segment (row located lazily, see
+        // `locate_scan_projected_rows`).
+        let mut scan_projected: HashMap<String, String> = HashMap::new();
+        // Cold score-ordered FTS hits whose `_source` is read only once the
+        // segment loop has settled the page: `_id` -> (segment, row).
+        let mut deferred_sources: HashMap<String, (String, u32, u64)> = HashMap::new();
         let materialisation_limit: usize = if mem_doc_count == 0
             && !deletes_present
             && size > 0
@@ -24717,8 +25935,121 @@ impl Index {
                                     // to simd_json here (the M7 raw-bytes
                                     // payload corruption noted below still
                                     // applies).
-                                    let slices_opt =
-                                        self.stored_slices_for(seg_id.as_str(), meta.doc_count);
+                                    //
+                                    // #2422/#2423 — but only when that offset
+                                    // index is already RESIDENT. Building it
+                                    // cold decompresses and brace-walks the
+                                    // whole section (every row, every column)
+                                    // to read the page, which is what a
+                                    // freshly started node, or one whose cache
+                                    // budget evicted the segment, paid on
+                                    // every query: seconds on a 30k-doc
+                                    // autoindex segment. Cold, decode only
+                                    // the rows the walk below can visit — the
+                                    // score-ordered prefix not already beaten
+                                    // by the page's entry worst (the walk's
+                                    // threshold only tightens, so this is a
+                                    // superset) — and only the columns the
+                                    // request can observe.
+                                    // #2422: set when the cold row window
+                                    // below was cut short; the walk then
+                                    // falls back to the full decode for any
+                                    // row past it instead of skipping it.
+                                    let mut cold_window_truncated = false;
+                                    // Cold score-ordered top-k: the walk
+                                    // reads only each candidate's `_id`
+                                    // (version-map check, dedup, page key),
+                                    // so decode the identity columns for
+                                    // every candidate and defer `_source`
+                                    // until the segment loop has picked the
+                                    // page's winners (see the hydration
+                                    // after the loop). The first segment a
+                                    // page meets has no score floor, so
+                                    // without this a broad query decoded the
+                                    // whole stored section inline to show
+                                    // five hits (~1.45 s on a 131 MB
+                                    // section).
+                                    let mut cold_ids: Option<HashMap<u32, String>> = None;
+                                    let cold_rows: Option<HashMap<u32, Value>> = if self
+                                        .stored_slices_cache
+                                        .contains_key(seg_id.as_str())
+                                        || self.decoded_stored_cache.contains_key(seg_id.as_str())
+                                    {
+                                        None
+                                    } else if sort_topk.is_none() {
+                                        let entry_worst = page_worst.as_ref().map(|worst| worst.0);
+                                        // A superset of the rows the walk can
+                                        // visit: the threshold only tightens.
+                                        let candidates: Vec<u32> = seg_hits
+                                            .iter()
+                                            .take_while(|sh| {
+                                                entry_worst.is_none_or(|worst| sh.score >= worst)
+                                            })
+                                            .map(|sh| sh.doc_id)
+                                            .collect();
+                                        if !candidates.is_empty() {
+                                            cold_ids =
+                                                self.cold_fts_row_ids(seg_id.as_str(), &candidates);
+                                        }
+                                        if cold_ids.is_some() {
+                                            self.cold_row_hydrations
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            self.schedule_cold_stored_warm(
+                                                seg_id.as_str(),
+                                                meta.doc_count,
+                                            );
+                                        }
+                                        None
+                                    } else {
+                                        // A field sort offers every match to
+                                        // the top-N heap, so its candidates
+                                        // are all matches: decode a bounded
+                                        // score-ordered window and read any
+                                        // row past it from the full decode.
+                                        let mut candidates: Vec<u32> =
+                                            seg_hits.iter().map(|sh| sh.doc_id).collect();
+                                        let window =
+                                            materialisation_limit.saturating_mul(4).max(256);
+                                        if candidates.len() > window {
+                                            candidates.truncate(window);
+                                            cold_window_truncated = true;
+                                        }
+                                        // Only with a column projection: the
+                                        // stored columns are whole-stream
+                                        // zstd, so an unprojected row decode
+                                        // decompresses every column anyway —
+                                        // the full cost — without leaving the
+                                        // offset index behind, and the
+                                        // background warm then pays it a
+                                        // second time (measured: a `_savings`
+                                        // request's first cold query went
+                                        // 2.3 s -> 6.6 s). The full decode
+                                        // below caches for the next query.
+                                        let worth_it = fts_row_keep.is_some();
+                                        if worth_it && !candidates.is_empty() {
+                                            let rows = self.hydrate_fts_rows_cold(
+                                                seg_id.as_str(),
+                                                &candidates,
+                                                fts_row_keep.as_deref(),
+                                            );
+                                            if rows.is_some() {
+                                                self.cold_row_hydrations
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                                self.schedule_cold_stored_warm(
+                                                    seg_id.as_str(),
+                                                    meta.doc_count,
+                                                );
+                                            }
+                                            rows
+                                        } else {
+                                            None
+                                        }
+                                    };
+                                    let slices_opt = if cold_rows.is_some() || cold_ids.is_some() {
+                                        None
+                                    } else {
+                                        self.stored_slices_for(seg_id.as_str(), meta.doc_count)
+                                    };
                                     // Legacy whole-section fallback ONLY when the
                                     // offset index can't be built (open/decode
                                     // failure or a malformed/incomplete section).
@@ -24729,6 +26060,8 @@ impl Index {
                                     // guaranteed present, so an open error is
                                     // real corruption.
                                     let whole_fallback: Option<Vec<Value>> = if slices_opt.is_some()
+                                        || cold_rows.is_some()
+                                        || cold_ids.is_some()
                                     {
                                         None
                                     } else {
@@ -24751,14 +26084,54 @@ impl Index {
                                             _ => None,
                                         }
                                     };
-                                    if slices_opt.is_some() || whole_fallback.is_some() {
+                                    if cold_rows.is_some()
+                                        || cold_ids.is_some()
+                                        || slices_opt.is_some()
+                                        || whole_fallback.is_some()
+                                    {
                                         // Owned parsed doc for a stored position,
                                         // shared by both source layouts.  The
                                         // slice arm parses one object on demand;
                                         // the fallback clones from the fully
                                         // decoded Vec.
+                                        let past_window: std::cell::OnceCell<
+                                            Option<Resident<StoredSlices>>,
+                                        > = std::cell::OnceCell::new();
                                         let fetch_doc = |pos: u32| -> Option<Value> {
-                                            if let Some(slices) = slices_opt.as_deref() {
+                                            if let Some(ids) = cold_ids.as_ref() {
+                                                // Identity only: `_source` is
+                                                // hydrated for the winners
+                                                // after the segment loop.
+                                                let id = ids.get(&pos)?;
+                                                let mut doc = serde_json::Map::with_capacity(1);
+                                                doc.insert(
+                                                    "_id".to_string(),
+                                                    Value::String(id.clone()),
+                                                );
+                                                return Some(Value::Object(doc));
+                                            }
+                                            if let Some(rows) = cold_rows.as_ref() {
+                                                if let Some(doc) = rows.get(&pos) {
+                                                    return Some(doc.clone());
+                                                }
+                                                if !cold_window_truncated {
+                                                    return None;
+                                                }
+                                                let slices = past_window
+                                                    .get_or_init(|| {
+                                                        self.stored_slices_for(
+                                                            seg_id.as_str(),
+                                                            meta.doc_count,
+                                                        )
+                                                    })
+                                                    .as_deref()?;
+                                                let &(start, end) =
+                                                    slices.offsets.get(pos as usize)?;
+                                                let slice = slices
+                                                    .bytes
+                                                    .get(start as usize..end as usize)?;
+                                                serde_json::from_slice::<Value>(slice).ok()
+                                            } else if let Some(slices) = slices_opt.as_deref() {
                                                 let &(start, end) =
                                                     slices.offsets.get(pos as usize)?;
                                                 let slice = slices
@@ -24896,6 +26269,18 @@ impl Index {
                                             let source =
                                                 doc.get("_source").cloned().unwrap_or(Value::Null);
                                             seen_ids.insert(id.clone());
+                                            if cold_ids.is_some() {
+                                                deferred_sources.insert(
+                                                    id.clone(),
+                                                    (seg_id.to_string(), sh.doc_id, meta.doc_count),
+                                                );
+                                            } else if cold_rows.is_some() && fts_row_keep.is_some()
+                                            {
+                                                row_projected.insert(
+                                                    id.clone(),
+                                                    (seg_id.to_string(), sh.doc_id),
+                                                );
+                                            }
                                             let hit = Hit {
                                                 id,
                                                 score: sh.score,
@@ -25473,39 +26858,88 @@ impl Index {
                         // Re-check both caches now that we hold this
                         // segment's flight lock — another thread may have
                         // decoded and published while we waited.
-                        let cached_bytes: Option<Vec<u8>> = self
+                        // #2427: hold the cached entry by `Arc` instead of
+                        // cloning the whole decoded section (hundreds of MB
+                        // per waiter on a large segment).
+                        enum ColdBytes<D, S> {
+                            Decoded(D),
+                            Slices(S),
+                            // `bool`: column-projected (never cached).
+                            Fresh(Vec<u8>, bool),
+                        }
+                        let cached = self
                             .decoded_stored_cache
                             .get(seg_id.as_str())
-                            .map(|e| e.value().value().clone())
+                            .map(|e| ColdBytes::Decoded(Arc::clone(e.value())))
                             .or_else(|| {
                                 self.stored_slices_cache
                                     .get(seg_id.as_str())
-                                    .map(|e| e.value().bytes.clone())
+                                    .map(|e| ColdBytes::Slices(Arc::clone(e.value())))
                             });
-                        let stored_bytes_opt = if let Some(bytes) = cached_bytes {
-                            Some(bytes)
+                        // #2427: an unsorted scan whose page can observe only
+                        // a known column set (`fts_row_keep`: the `_source`
+                        // includes plus every field the query reads) decodes
+                        // just those columns. On a semantic_text corpus the
+                        // generated `*_vector` / `*_vector_chunks` / passage
+                        // metadata columns are ~85% of a full decode and of
+                        // its transient peak (20k-doc segment: ~716 MB peak
+                        // full vs ~82 MB projected), none of which the
+                        // response can return. Projected bytes are never
+                        // published to `decoded_stored_cache`.
+                        let scan_keep: Option<&[String]> =
+                            if sorted_candidates_path || sort_topk.is_some() {
+                                None
+                            } else {
+                                fts_row_keep.as_deref()
+                            };
+                        let stored_src = if cached.is_some() {
+                            cached
                         } else {
                             let seg_reader = self.store.open_segment_arc(&seg_id)?;
                             match seg_reader.section(SectionType::Stored) {
                                 Ok(Some(stored_bytes_raw)) => {
-                                    xerj_storage::stored_codec::decode_stored(stored_bytes_raw).ok()
+                                    let projected = scan_keep.and_then(|keep| {
+                                        xerj_storage::stored_codec::decode_stored_keeping(
+                                            stored_bytes_raw,
+                                            &|column: &str| {
+                                                row_projection_keeps_column(keep, column)
+                                            },
+                                        )
+                                        .ok()
+                                        .flatten()
+                                    });
+                                    match projected {
+                                        Some(bytes) => Some(ColdBytes::Fresh(bytes, true)),
+                                        None => xerj_storage::stored_codec::decode_stored(
+                                            stored_bytes_raw,
+                                        )
+                                        .ok()
+                                        .map(|bytes| ColdBytes::Fresh(bytes, false)),
+                                    }
                                 }
                                 _ => None,
                             }
                         };
                         dbg_decode_ms += t_dec.elapsed().as_millis() as u64;
-                        if let Some(stored_bytes) = stored_bytes_opt {
+                        if let Some(stored_src) = stored_src {
                             {
                                 let t_scan = std::time::Instant::now();
+                                let stored_bytes: &[u8] = match &stored_src {
+                                    ColdBytes::Decoded(entry) => entry.value(),
+                                    ColdBytes::Slices(slices) => &slices.bytes,
+                                    ColdBytes::Fresh(bytes, _) => bytes,
+                                };
+                                let projected = matches!(stored_src, ColdBytes::Fresh(_, true));
                                 // Record per-doc offsets on the sorted path so
                                 // the decompressed section can be cached for
                                 // the next query (subject to the budget).
                                 let mut offsets: Vec<(u32, u32)> = Vec::new();
                                 let want_cache = sorted_candidates_path
+                                    && !projected
                                     && stored_bytes.len() <= u32::MAX as usize
                                     && !self.stored_slices_cache.contains_key(seg_id.as_str());
                                 self.scan_stored_section_into(
-                                    &stored_bytes,
+                                    stored_bytes,
                                     query,
                                     is_match_all,
                                     ids_only,
@@ -25526,12 +26960,23 @@ impl Index {
                                     &dmq_schema,
                                 );
                                 dbg_scan_ms += t_scan.elapsed().as_millis() as u64;
+                                if projected {
+                                    for hit in all_hits.iter().skip(hits_before_segment) {
+                                        scan_projected.insert(hit.id.clone(), seg_id.clone());
+                                    }
+                                }
                                 // Cache only a COMPLETE offsets map (a
                                 // malformed section bails early) and only
                                 // within the retained-bytes budget.
                                 if want_cache && offsets.len() as u64 == meta.doc_count {
                                     let slices = StoredSlices {
-                                        bytes: stored_bytes,
+                                        bytes: match stored_src {
+                                            ColdBytes::Fresh(bytes, _) => bytes,
+                                            // Promote a decoded-cache entry
+                                            // into the sorted-path cache.
+                                            ColdBytes::Decoded(entry) => entry.value().clone(),
+                                            ColdBytes::Slices(slices) => slices.bytes.clone(),
+                                        },
                                         offsets,
                                     };
                                     let bytes = cache_estimates::stored_slices_bytes(
@@ -25548,12 +26993,18 @@ impl Index {
                                         bytes,
                                         slices,
                                     );
-                                } else if !want_cache {
+                                } else if let (false, ColdBytes::Fresh(stored_bytes, false)) =
+                                    (want_cache, stored_src)
+                                {
                                     // Unsorted path: retain the decompressed
                                     // section so the NEXT query on this
                                     // segment skips the decompress (the
                                     // read-under-write match_all/bool/range
                                     // tail fix — see `decoded_stored_cache`).
+                                    // Only a fresh FULL decode: a cache hit
+                                    // is already resident, and projected
+                                    // bytes would serve other queries a
+                                    // partial `_source`.
                                     let bytes = cache_estimates::decoded_stored_bytes(
                                         &seg_id,
                                         std::mem::size_of::<CacheResident<Vec<u8>>>(),
@@ -25609,6 +27060,14 @@ impl Index {
                     all_hits = decorated.into_iter().map(|(_, h)| h).collect();
                 }
             }
+        }
+        if !deferred_sources.is_empty() {
+            all_hits = self.hydrate_deferred_cold_sources(
+                all_hits,
+                &deferred_sources,
+                fts_row_keep.as_deref(),
+                &mut row_projected,
+            );
         }
         drop(snap);
 
@@ -25932,6 +27391,30 @@ impl Index {
                     })
                     .unwrap_or_default();
                 if !query_terms.is_empty() {
+                    // This heuristic reads the whole serialized document, so
+                    // a column-projected cold hit gets its full source back
+                    // first (#2422/#2423); rare path, a handful of rows.
+                    if !scan_projected.is_empty() {
+                        self.locate_scan_projected_rows(
+                            &final_hits,
+                            &scan_projected,
+                            &mut row_projected,
+                        );
+                    }
+                    if !row_projected.is_empty() {
+                        for hit in final_hits.iter_mut() {
+                            let Some((seg, pos)) = row_projected.get(&hit.id) else {
+                                continue;
+                            };
+                            if let Some(source) = self
+                                .hydrate_fts_rows_cold(seg, &[*pos], None)
+                                .and_then(|mut rows| rows.remove(pos))
+                                .and_then(|mut doc| doc.get_mut("_source").map(Value::take))
+                            {
+                                hit.source = source;
+                            }
+                        }
+                    }
                     let n_docs = final_hits.len() as f32;
                     // Pre-compute lowercased source strings to avoid double-borrowing.
                     let src_strings: Vec<String> = final_hits
@@ -28338,6 +29821,38 @@ pub fn doc_values_skip_set(schema: &Schema) -> std::collections::HashSet<String>
     skip
 }
 
+/// The doc-values input of a merge batch, read back from the batch's
+/// merged stored JSON one document at a time (#2427).
+///
+/// `merged_json` is the `[doc,doc,...]` array the merge byte-copies its
+/// survivors into, in merged ordinal order. Each item is that document's
+/// `_source` (or `Null` when it has none or does not parse, the same
+/// fallback the merge used when it held the trees), and is dropped by
+/// [`build_doc_value_columns`] before the next one is parsed. Only one
+/// `_source` tree is alive at a time; before #2427 the merge held one per
+/// surviving document from the drain loop to the end of the batch, on top
+/// of the stored encoder's own `Vec<Value>` of the same documents.
+///
+/// `Err` means the buffer is not a JSON array (it is built from documents
+/// that already parsed as `RawValue`, so this does not happen in practice).
+fn merge_doc_value_sources(
+    merged_json: &[u8],
+) -> std::result::Result<impl Iterator<Item = Option<Value>> + '_, serde_json::Error> {
+    #[derive(serde::Deserialize)]
+    struct SourceOnly {
+        #[serde(rename = "_source", default)]
+        source: Value,
+    }
+    let docs: Vec<&serde_json::value::RawValue> = serde_json::from_slice(merged_json)?;
+    Ok(docs.into_iter().map(|raw| {
+        Some(
+            serde_json::from_str::<SourceOnly>(raw.get())
+                .map(|doc| doc.source)
+                .unwrap_or(Value::Null),
+        )
+    }))
+}
+
 /// Build the per-segment doc-values columns.
 ///
 /// `skip` names fields whose declared mapping says they must not have
@@ -28351,8 +29866,8 @@ pub fn doc_values_skip_set(schema: &Schema) -> std::collections::HashSet<String>
 /// and 35.6% of the whole index. It is much smaller where `_source` dominates
 /// (6.97% across the `xc-*` code corpora), so the saving is corpus-dependent and
 /// must always be quoted as a range.
-fn build_doc_value_columns<'a>(
-    sources: impl Iterator<Item = Option<&'a Value>>,
+fn build_doc_value_columns<V: std::borrow::Borrow<Value>>(
+    sources: impl Iterator<Item = Option<V>>,
     skip: &std::collections::HashSet<String>,
 ) -> std::collections::BTreeMap<String, xerj_storage::doc_values::Column> {
     use std::collections::BTreeMap;
@@ -28397,7 +29912,10 @@ fn build_doc_value_columns<'a>(
     for src in sources {
         let doc_idx = total_docs;
         total_docs += 1;
-        let Some(obj) = src.and_then(|v| v.as_object()) else {
+        let Some(obj) = src
+            .as_ref()
+            .and_then(|v| <V as std::borrow::Borrow<Value>>::borrow(v).as_object())
+        else {
             continue;
         };
         for (field, val) in obj {
@@ -33315,6 +34833,16 @@ impl Index {
         ))
     }
 
+    /// `_id` of every row of a segment's columnar stored section, read from
+    /// its identity columns only. `None` (legacy layout, read error, a row
+    /// count other than `expect_docs`) sends the caller to the full decode.
+    fn cold_segment_ids(&self, seg_id: &str, expect_docs: u64) -> Option<Vec<Value>> {
+        let reader = self.store.open_segment_arc(seg_id).ok()?;
+        let bytes = reader.section(SectionType::Stored).ok()??;
+        let ids = xerj_storage::stored_codec::decode_stored_v2_ids(bytes).ok()??;
+        (ids.len() as u64 == expect_docs).then_some(ids)
+    }
+
     /// Per-segment GHOST-position bitmap (b7 DEFECT 1c): bit `pos` set ⇔
     /// the stored doc at `pos` is tombstoned or superseded — its live
     /// version resides in another segment or the memtable per the version
@@ -33335,21 +34863,39 @@ impl Index {
                 return Some(Arc::clone(&entry.value().1));
             }
         }
-        let slices = self.stored_slices_for(seg_id, expect_docs)?;
-        let mut bm = vec![0u64; slices.offsets.len().div_ceil(64)];
-        for (pos, &(start, end)) in slices.offsets.iter().enumerate() {
-            let slice = slices.bytes.get(start as usize..end as usize)?;
-            let doc: Value = serde_json::from_slice(slice).ok()?;
-            let id = doc.get("_id").and_then(Value::as_str).unwrap_or("");
-            let ghost = match self.store.version_map.get(id) {
-                Some(ver) => ver.deleted || ver.segment_id.as_ref() != seg_id,
-                // Not in the version map → nothing has ever superseded it.
-                None => false,
-            };
-            if ghost {
-                bm[pos / 64] |= 1u64 << (pos % 64);
+        let is_ghost = |id: &str| match self.store.version_map.get(id) {
+            Some(ver) => ver.deleted || ver.segment_id.as_ref() != seg_id,
+            // Not in the version map → nothing has ever superseded it.
+            None => false,
+        };
+        // A cold segment reads its `_id` column alone: decoding (and
+        // caching) the whole stored section here made the first query
+        // under deletes pay for every row's `_source`.
+        let cold = !self.stored_slices_cache.contains_key(seg_id)
+            && !self.decoded_stored_cache.contains_key(seg_id);
+        let cold_ids = cold
+            .then(|| self.cold_segment_ids(seg_id, expect_docs))
+            .flatten();
+        let bm = if let Some(ids) = cold_ids {
+            let mut bm = vec![0u64; ids.len().div_ceil(64)];
+            for (pos, id) in ids.iter().enumerate() {
+                if is_ghost(id.as_str().unwrap_or("")) {
+                    bm[pos / 64] |= 1u64 << (pos % 64);
+                }
             }
-        }
+            bm
+        } else {
+            let slices = self.stored_slices_for(seg_id, expect_docs)?;
+            let mut bm = vec![0u64; slices.offsets.len().div_ceil(64)];
+            for (pos, &(start, end)) in slices.offsets.iter().enumerate() {
+                let slice = slices.bytes.get(start as usize..end as usize)?;
+                let doc: Value = serde_json::from_slice(slice).ok()?;
+                if is_ghost(doc.get("_id").and_then(Value::as_str).unwrap_or("")) {
+                    bm[pos / 64] |= 1u64 << (pos % 64);
+                }
+            }
+            bm
+        };
         let bm = Arc::new(bm);
         // Bounded like `shortcut_count_cache`: wholesale clear — entries
         // are per-segment (not query-shaped) so the cap is generous.
@@ -34992,6 +36538,30 @@ async fn do_flush_shard(
             }
         }
     };
+    // #2427 — while the parent RSS breaker is engaged, finalizes run one at
+    // a time (see `flush_pressure_gate`). Same deadline and same
+    // before-the-freeze failure as the finalize gate above.
+    let pressure_permit = if !bypass_finalize_gate
+        && crate::governor::global().is_some_and(|g| g.memory_breaker_engaged())
+    {
+        match wait_for_flush_permit(
+            &index_name,
+            "the memory-pressure flush gate",
+            admit_timeout,
+            crate::flush_pressure_gate().acquire(),
+        )
+        .await
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                drop(fin_permit);
+                on_drained();
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
     // #1015 — NO collection-publication guard here.  The drain below is a
     // FREEZE, not a removal: the claimed docs stay reader-visible in the
     // shard's frozen generations for the whole segment build, so there is
@@ -35252,7 +36822,7 @@ async fn do_flush_shard(
                 let columns = build_doc_value_columns(
                     drained_fts_for_build
                         .iter()
-                        .map(|(_id, _fields, src)| Some(src.as_ref())),
+                        .map(|(_id, _fields, src)| Some(&**src)),
                     &dv_skip_for_flush,
                 );
                 if !columns.is_empty() {
@@ -35386,6 +36956,7 @@ async fn do_flush_shard(
         }
         let joined = tokio::task::spawn_blocking(move || {
             let _fin_permit = fin_permit;
+            let _pressure_permit = pressure_permit;
             // This lease lives in the blocking worker, not either async waiter.
             // It spans build→publish exactly as before: it tracks the caches
             // `build_fts` warms so a failed publication can evict them.
@@ -42514,6 +44085,147 @@ fn choose_passage_winner(best: &mut Option<(f32, u32)>, score: f32, ordinal: u32
     if best.is_none_or(|(current, _)| score > current) {
         *best = Some((score, ordinal));
     }
+}
+
+/// Source fields the lexical `_passage` builder reads beyond the query's own
+/// fields: the autoindex code-document signature
+/// ([`is_autoindex_code_document`], [`refine_code_passage`]) and the PDF page
+/// identity ([`passage_page_from_source`]).
+const ROW_PROJECTION_PASSAGE_FIELDS: &[&str] = &[
+    "symbol_count",
+    "name",
+    "kind",
+    "code",
+    "language",
+    "line",
+    "body",
+    "page",
+    "page_number",
+    "metadata",
+];
+
+/// #2422/#2423: the source fields a scored FTS page can observe, when the
+/// request makes that set knowable — `None` means "every column".
+///
+/// A narrowing `_source` include list is the caller saying which fields it
+/// wants back; the engine itself still reads the query's fields for the
+/// heuristic IDF rescore and for `_passage`. Everything else on the request
+/// that can read an arbitrary source field (aggs, sort, scripts, collapse,
+/// rescore, explain, highlight, `fields` other than `_passage`, the
+/// `_savings` measurement that counts the bytes a filter withheld, a query
+/// clause this walker does not know) keeps the whole document.
+fn fts_row_hydration_keep(request: &SearchRequest, query: &QueryNode) -> Option<Vec<String>> {
+    let includes = match &request.source {
+        SourceFilter::Includes(includes) => includes,
+        SourceFilter::Fields { includes, .. } => includes,
+        // `Enabled(false)` still needs the raw source: the response layer
+        // resolves `fields` from it and suppresses it later.
+        SourceFilter::Default | SourceFilter::Enabled(_) => return None,
+    };
+    if includes.is_empty()
+        || request.aggs.is_some()
+        || !request.sort.is_empty()
+        || request.script_fields.is_some()
+        || request.collapse.is_some()
+        || !request.rescore.is_empty()
+        || request.explain
+        || request.highlight.is_some()
+        || request.leaf_ts_field.is_some()
+        || !matches!(request.savings, xerj_query::ast::SavingsMode::Off)
+        || request
+            .fields
+            .iter()
+            .any(|field| field != PASSAGE_RESPONSE_FIELD)
+    {
+        return None;
+    }
+    let mut keep: Vec<String> = includes.clone();
+    if !collect_row_projection_query_fields(query, &mut keep) {
+        return None;
+    }
+    if passage_requested(request) {
+        keep.extend(
+            ROW_PROJECTION_PASSAGE_FIELDS
+                .iter()
+                .map(|f| (*f).to_string()),
+        );
+    }
+    keep.sort();
+    keep.dedup();
+    Some(keep)
+}
+
+/// Push every field `query` reads; `false` for a clause whose source reads
+/// are not knowable from the tree (scripts, field-less `multi_match`,
+/// `query_string` syntax, vectors, nested, …).
+fn collect_row_projection_query_fields(query: &QueryNode, out: &mut Vec<String>) -> bool {
+    let mut push = |field: &str| {
+        let (name, _boost) = parse_field_boost(field);
+        out.push(name.to_string());
+    };
+    match query {
+        QueryNode::MatchAll | QueryNode::MatchNone | QueryNode::Ids { .. } => true,
+        QueryNode::Match { field, .. }
+        | QueryNode::MatchPhrase { field, .. }
+        | QueryNode::Term { field, .. }
+        | QueryNode::Terms { field, .. }
+        | QueryNode::Range { field, .. }
+        | QueryNode::Prefix { field, .. }
+        | QueryNode::Wildcard { field, .. }
+        | QueryNode::Exists { field } => {
+            if field.contains('*') {
+                return false;
+            }
+            push(field);
+            true
+        }
+        QueryNode::MultiMatch { fields, .. } => {
+            if fields.is_empty() || fields.iter().any(|f| f.contains('*')) {
+                return false;
+            }
+            for field in fields {
+                push(field);
+            }
+            true
+        }
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            ..
+        } => must
+            .iter()
+            .chain(should)
+            .chain(must_not)
+            .chain(filter)
+            .all(|q| collect_row_projection_query_fields(q, out)),
+        QueryNode::Constant { query, .. } | QueryNode::Boosted { query, .. } => {
+            collect_row_projection_query_fields(query, out)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the stored top-level `column` can hold a value of one of the
+/// `keep` field paths (`keep` entries may be dotted paths or `prefix*`
+/// patterns; a column may itself be a flattened dotted key).
+fn row_projection_keeps_column(keep: &[String], column: &str) -> bool {
+    keep.iter().any(|field| {
+        if let Some(prefix) = field.strip_suffix('*') {
+            if prefix.contains('*') {
+                return true;
+            }
+            return column.starts_with(prefix)
+                || prefix.starts_with(column) && prefix[column.len()..].starts_with('.');
+        }
+        if field.contains('*') {
+            return true;
+        }
+        column == field
+            || field.starts_with(column) && field[column.len()..].starts_with('.')
+            || column.starts_with(field.as_str()) && column[field.len()..].starts_with('.')
+    })
 }
 
 fn passage_requested(request: &SearchRequest) -> bool {
@@ -53732,6 +55444,42 @@ fn multi_match_field_is_mapped(
     false
 }
 
+/// Is `q` a single-field term-level or phrase leaf whose field is UNMAPPED
+/// in this index (no schema field anywhere on its dotted prefix chain, by
+/// the same rule as [`multi_match_field_is_mapped`])?
+///
+/// Such a leaf matches no document, so the FTS projection may skip it as a
+/// `should` child. Declines (returns `false`) when the index has no schema
+/// fields at all — an unmapped index keeps the stored-doc scan, as before —
+/// and for every other node shape, including `range` / `exists`, whose
+/// unmapped semantics this does not need to change.
+fn should_leaf_targets_unmapped_field(
+    q: &QueryNode,
+    text_fields: &[String],
+    exact_fields: &std::collections::HashSet<String>,
+) -> bool {
+    if text_fields.is_empty() && exact_fields.is_empty() {
+        return false;
+    }
+    let field = match q {
+        QueryNode::Term { field, .. }
+        | QueryNode::Terms { field, .. }
+        | QueryNode::MatchPhrase { field, .. }
+        | QueryNode::MatchPhrasePrefix { field, .. }
+        | QueryNode::Prefix { field, .. }
+        | QueryNode::Wildcard { field, .. }
+        | QueryNode::Fuzzy { field, .. }
+        | QueryNode::Regexp { field, .. } => field.as_str(),
+        _ => return false,
+    };
+    // Metadata fields (`_id`, `_index`, …) are never schema fields but are
+    // always "mapped"; leave them on their existing path.
+    if field.starts_with('_') {
+        return false;
+    }
+    !multi_match_field_is_mapped(field, text_fields, exact_fields)
+}
+
 /// Collect every field name referenced by an FTS query tree.
 ///
 /// Used to (a) extend the set of side-car fields `FtsIndexReader::open`
@@ -54670,6 +56418,21 @@ fn query_node_to_fts_projected(
                 }
             }
             for sub in should {
+                // A term-level / phrase leaf on a field this index does not
+                // map at all matches NO document (ES rewrites it to
+                // `MatchNoDocsQuery`), so as a `should` child it can neither
+                // add a hit nor change a score — skip it instead of letting
+                // its `None` abort the whole projection. Without this, the
+                // CLI's code-shaped body (`term` on `name`, `match_phrase` on
+                // `defs`) sent across a mixed code+docs prefix pushed every
+                // docs index onto the full stored-doc scan (`needs_fts=false`,
+                // every row decoded): 13 s on 93k docs, the 30 s search
+                // deadline on larger ones. `minimum_should_match` was already
+                // resolved above against the ORIGINAL clause count, which is
+                // what ES does too (the no-docs clause still counts).
+                if should_leaf_targets_unmapped_field(sub, text_fields, exact_fields) {
+                    continue;
+                }
                 // A `should` clause that can't be projected to FTS (e.g.
                 // MatchPhrase over indexed phrases) must NOT be silently
                 // dropped — dropping it makes the bool LESS permissive and
@@ -56600,12 +58363,12 @@ fn scored_fast_plan(
     }
 }
 
-/// Default chunk size (characters) for auto-embed-on-ingest chunking.
-/// `EmbeddingConfig` has no per-field chunk parameter yet, so this is a
-/// sensible fixed default (roughly a paragraph).
-const SEMANTIC_CHUNK_SIZE: usize = 512;
-/// Default overlap (characters) between consecutive chunks.
-const SEMANTIC_CHUNK_OVERLAP: usize = 64;
+// #1122/#2433: the lexical chunk/embed/pool recipe lives in xerj-ai so the
+// stored-section codec can regenerate the derived vectors bit-identically
+// instead of persisting them in every stored `_source`.
+#[cfg(test)]
+use xerj_ai::semantic_lexical::SEMANTIC_CHUNK_SIZE;
+use xerj_ai::semantic_lexical::{local_chunk_vectors, mean_pool_normalize, semantic_chunker};
 
 /// Select one order-preserving caller-side embedding window. One oversized
 /// document-field job remains whole so the planner always makes progress.
@@ -56943,67 +58706,6 @@ mod semantic_embedding_window_tests {
             );
         }
     }
-}
-
-/// The chunker used by the auto-embed-on-ingest path.
-fn semantic_chunker() -> xerj_ai::TextChunker {
-    xerj_ai::TextChunker::new(SEMANTIC_CHUNK_SIZE, SEMANTIC_CHUNK_OVERLAP)
-}
-
-/// L2-normalize each input vector, mean-pool across all of them, then
-/// re-normalize the pooled result. Produces a unit-norm vector of the same
-/// dimensionality as the inputs (empty input => empty vec). Vectors whose
-/// length differs from the first are skipped.
-fn mean_pool_normalize(vectors: &[Vec<f32>]) -> Vec<f32> {
-    let dims = match vectors.first() {
-        Some(v) => v.len(),
-        None => return Vec::new(),
-    };
-    let mut acc = vec![0.0f32; dims];
-    let mut used = 0usize;
-    for v in vectors {
-        if v.len() != dims {
-            continue;
-        }
-        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for (a, x) in acc.iter_mut().zip(v.iter()) {
-                *a += x / norm;
-            }
-            used += 1;
-        }
-    }
-    if used > 0 {
-        let inv = 1.0 / used as f32;
-        for a in acc.iter_mut() {
-            *a *= inv;
-        }
-    }
-    // Re-normalize the pooled vector to unit length.
-    let norm = acc.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for a in acc.iter_mut() {
-            *a /= norm;
-        }
-    }
-    acc
-}
-
-/// Chunk `text` and embed each overlapping chunk with the built-in *local*
-/// embedder, returning one unit-norm vector per passage. Short text
-/// (<= chunk_size) produces a single chunk, so the result is
-/// `vec![local_embed(text, dims)]`. This is the per-chunk primitive used by
-/// the auto-embed-on-ingest path to persist passage vectors for max-sim
-/// semantic scoring.
-fn local_chunk_vectors(text: &str, dims: usize) -> Vec<Vec<f32>> {
-    let chunks = semantic_chunker().chunk(text, None);
-    if chunks.len() <= 1 {
-        return vec![xerj_ai::local::local_embed(text, dims)];
-    }
-    chunks
-        .iter()
-        .map(|c| xerj_ai::local::local_embed(&c.text, dims))
-        .collect()
 }
 
 /// Chunk `text` and mean-pool the per-chunk *local* embeddings into a single
@@ -58476,6 +60178,122 @@ mod fts_projection_tests {
             &kw(&["status"]),
         )
         .is_none());
+    }
+
+    /// A `should` `term` / `match_phrase` on a field this index does not map
+    /// matches nothing, so it must not abort the projection (which sent the
+    /// CLI's code-shaped body onto the full stored-doc scan of every docs
+    /// index). The projection equals the same bool without those clauses.
+    #[test]
+    fn bool_should_unmapped_term_and_phrase_are_skipped() {
+        let text_fields = vec!["body".to_string()];
+        let exact = kw(&["title"]);
+        let mapped = QueryNode::Match {
+            field: "body".into(),
+            query: "span context".into(),
+            operator: xerj_query::ast::BoolOperator::Or,
+            boost: None,
+            analyzer: None,
+            minimum_should_match: None,
+            lenient: false,
+        };
+        let ghost_term = QueryNode::Term {
+            field: "name".into(),
+            value: serde_json::json!("span context"),
+            boost: Some(10.0),
+        };
+        let ghost_phrase = QueryNode::MatchPhrase {
+            field: "defs".into(),
+            query: "span context".into(),
+            slop: 0,
+            analyzer: None,
+            boost: Some(8.0),
+            lenient: false,
+        };
+        let bool_of = |should: Vec<QueryNode>| QueryNode::Bool {
+            must: vec![],
+            should,
+            filter: vec![],
+            must_not: vec![],
+            minimum_should_match: None,
+        };
+        let with_ghosts = query_node_to_fts(
+            &bool_of(vec![
+                mapped.clone(),
+                ghost_term.clone(),
+                ghost_phrase.clone(),
+            ]),
+            &text_fields,
+            &exact,
+        )
+        .expect("unmapped should leaves must not abort the projection");
+        let control = query_node_to_fts(&bool_of(vec![mapped.clone()]), &text_fields, &exact)
+            .expect("control projects");
+        assert_eq!(format!("{with_ghosts:?}"), format!("{control:?}"));
+        let mut fields = Vec::new();
+        collect_fts_query_fields(&with_ghosts, &mut fields);
+        assert_eq!(fields, vec!["body".to_string()]);
+
+        // Only unmapped leaves: nothing positive projects, so the projection
+        // still declines (stored scan answers, as before).
+        assert!(query_node_to_fts(
+            &bool_of(vec![ghost_term, ghost_phrase]),
+            &text_fields,
+            &exact
+        )
+        .is_none());
+    }
+
+    /// The skip is for UNMAPPED fields only: a `should` `term` on a mapped
+    /// TEXT field (not projectable as a term) still declines the projection,
+    /// a dotted sub-field of a mapped parent is still treated as mapped, and
+    /// a schema-less index never skips anything.
+    #[test]
+    fn bool_should_skip_is_limited_to_unmapped_fields() {
+        let text_fields = vec!["body".to_string(), "path".to_string()];
+        let exact = kw(&[]);
+        let mapped = QueryNode::Match {
+            field: "body".into(),
+            query: "span".into(),
+            operator: xerj_query::ast::BoolOperator::Or,
+            boost: None,
+            analyzer: None,
+            minimum_should_match: None,
+            lenient: false,
+        };
+        let term_on = |f: &str| QueryNode::Term {
+            field: f.into(),
+            value: serde_json::json!("x"),
+            boost: None,
+        };
+        let bool_of = |should: Vec<QueryNode>| QueryNode::Bool {
+            must: vec![],
+            should,
+            filter: vec![],
+            must_not: vec![],
+            minimum_should_match: None,
+        };
+        for f in ["body", "path.keyword", "_id"] {
+            assert!(
+                query_node_to_fts(
+                    &bool_of(vec![mapped.clone(), term_on(f)]),
+                    &text_fields,
+                    &exact
+                )
+                .is_none(),
+                "term on {f} must keep the stored-scan route"
+            );
+        }
+        assert!(!should_leaf_targets_unmapped_field(
+            &term_on("ghost"),
+            &[],
+            &kw(&[])
+        ));
+        assert!(should_leaf_targets_unmapped_field(
+            &term_on("ghost"),
+            &text_fields,
+            &exact
+        ));
     }
 
     /// Dotted sub-paths under a mapped parent (`title.keyword`, `user.name`)
